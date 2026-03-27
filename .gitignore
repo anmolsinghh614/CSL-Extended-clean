@@ -1,0 +1,73 @@
+# System & IDE
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.vscode/
+.idea/
+.DS_Store
+
+# Datasets
+data/
+balanced_dataset/
+
+# Model Checkpoints & Weights
+*.pth
+*.pt
+checkpoints/
+memory_checkpoints/
+test_checkpoints/
+test_memory_checkpoints/
+demo_memory_checkpoints/
+feature_ddpm_checkpoints/
+models/*.pth
+models/*.pt
+
+# Experiment Results & Outputs
+results/
+test_results/
+full_option3_results/
+option3_test_results/
+test_logs/
+test_memory/
+test_features/
+test_prompts/
+
+# Generated Images
+generated_images/
+option3_generated_images/
+test_images/
+synthetic_cifar10_images/
+option1_cifar10_images/
+demo_synthetic_images/
+*_images/
+
+# Caches
+clip_cache/
+demo_clip_cache/
+
+# Generated Reports & Logs
+*.log
+*_report.json
+*_analysis.json
+*_final.json
+tail_class_analysis_*.json
+training_summary.json
+final_report_*.json
+
+# Visualizations
+*.png
+*.jpg
+*.jpeg
+*_visualization.png
+
+# Large Files & Archives
+*.zip
+*.tar.gz
+Phase 5.1.zip
+et --hard 778f941
+
+# Temporary Generated Configs
+test_config.json
+*_prompts.json
