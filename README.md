@@ -1,4 +1,4 @@
-# Memory-Conditioned Diffusion Model for Long-Tail Recognition
+# Memory-Conditioned Diffusion Model for Long-Tail Hallucination
 
 <p align="center">
   <b>Improving Tail Class Accuracy via Memory-Guided Synthetic Data Generation</b>
