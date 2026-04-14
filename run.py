@@ -138,19 +138,19 @@ def run_full_training():
             'update_interval': 100
         },
         'training': {
-            'initial_epochs': 50,         # More epochs for better convergence
-            'synthetic_epochs': 15,       # Enough to integrate synthetic features
+            'initial_epochs': 200,        # ResNet-34 needs ~200 epochs on CIFAR-10
+            'synthetic_epochs': 25,       # Enough to integrate synthetic features
             'lr': 0.1,
             'momentum': 0.9,
             'weight_decay': 5e-4,
-            'scheduler_milestones': [30, 40],  # Decay at 60% and 80% of total
+            'scheduler_milestones': [160, 180],  # Decay at 80% and 90% of total
             'scheduler_gamma': 0.1
         },
         'generation': {
             'num_prompts_per_tail_class': 50,
             'images_per_prompt': 4,
             'generation_rounds': 3,
-            'tail_improvement_threshold': 0.05,
+            'tail_improvement_threshold': 2.0,
             'option3_temperature': 0.8,
             'use_blip': True,
             'use_clip': True
@@ -159,7 +159,7 @@ def run_full_training():
             'enabled': True,
             'num_timesteps': 1000,
             'beta_schedule': 'cosine',
-            'hidden_dim': 512,            # Match feature_dim for better capacity
+            'hidden_dim': 1024,           # 2x feature_dim for better capacity
             'num_layers': 4,
             'training_steps': 10000,      # More training = better feature quality
             'features_per_class': 300     # More synthetic features per tail class

@@ -8,3 +8,6 @@ tqdm
 diffusers
 transformers
 accelerate
+ftfy
+regex
+git+https://github.com/openai/CLIP.git

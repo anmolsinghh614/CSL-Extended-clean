@@ -140,8 +140,11 @@ class CSLLossFunc(nn.Module):
         # Clean predictions globally to avoid downstream ripples
         y_pred = torch.nan_to_num(y_pred, nan=0.0)
         
+        # Ensure class_weights are on the same device as inputs
+        weight = self.class_weights.to(y_pred.device) if self.class_weights is not None else None
+        
         # Core loss: Class-balanced Cross Entropy
-        cross_entropy_loss = F.cross_entropy(y_pred, y_true, weight=self.class_weights)
+        cross_entropy_loss = F.cross_entropy(y_pred, y_true, weight=weight)
         
         # CSL additional term for tail class boosting
         additional_term = self.additional_term_layer(y_pred, y_true, epoch)

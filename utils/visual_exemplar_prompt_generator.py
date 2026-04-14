@@ -162,8 +162,8 @@ class VisualExemplarPromptGenerator:
             if image.shape[0] == 3:  # RGB
                 # Denormalize if normalized (assume ImageNet normalization)
                 if image.min() < 0:  # Likely normalized
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
+                    std = torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
                     image = image * std + mean
                 
                 # Clamp to [0, 1] and convert to PIL
@@ -385,8 +385,8 @@ class VisualExemplarPromptGenerator:
             if image.shape[0] == 3:  # RGB
                 # Denormalize if needed
                 if image.min() < 0:
-                    mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-                    std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+                    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
+                    std = torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
                     image = image * std + mean
                 
                 image = torch.clamp(image, 0, 1)

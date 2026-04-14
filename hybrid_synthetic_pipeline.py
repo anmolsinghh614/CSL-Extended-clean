@@ -348,8 +348,13 @@ def train_epoch_with_hybrid_features(model, criterion, optimizer, train_loader,
                     phase3_ratio=phase3_ratio
                 )
                 
-                # Pass through classifier
-                syn_outputs = model.fc(syn_features)
+                # Pass through classifier (handle ResNet wrapper structure)
+                if hasattr(model, 'model') and hasattr(model.model, 'fc'):
+                    syn_outputs = model.model.fc(syn_features)
+                elif hasattr(model, 'fc'):
+                    syn_outputs = model.fc(syn_features)
+                else:
+                    raise AttributeError("Could not find classifier (.fc) in model")
                 
                 all_outputs.append(syn_outputs)
                 all_labels.append(syn_labels)

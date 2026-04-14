@@ -120,12 +120,12 @@ class MemoryConditionedOrchestrator:
             
             # Training configuration
             'training': {
-                'initial_epochs': 50,         # More epochs for better convergence
-                'synthetic_epochs': 15,       # Enough to integrate synthetic features
+                'initial_epochs': 200,        # ResNet-34 needs ~200 epochs on CIFAR-10
+                'synthetic_epochs': 25,       # Enough to integrate synthetic features
                 'lr': 0.1,
                 'momentum': 0.9,
                 'weight_decay': 5e-4,
-                'scheduler_milestones': [30, 40],  # Decay at 60% and 80% of total
+                'scheduler_milestones': [160, 180],  # Decay at 80% and 90% of total
                 'scheduler_gamma': 0.1
             },
             
@@ -134,7 +134,7 @@ class MemoryConditionedOrchestrator:
                 'num_prompts_per_tail_class': 50,
                 'images_per_prompt': 4,
                 'generation_rounds': 3,
-                'tail_improvement_threshold': 0.05,  # 5% improvement to continue
+                'tail_improvement_threshold': 5.0,  # 5 percentage points improvement to continue
                 'option3_temperature': 0.8,
                 'use_blip': True,
                 'use_clip': True
@@ -145,7 +145,7 @@ class MemoryConditionedOrchestrator:
                 'enabled': True,
                 'num_timesteps': 1000,
                 'beta_schedule': 'cosine',
-                'hidden_dim': 512,            # Match feature_dim for better capacity
+                'hidden_dim': 1024,           # 2x feature_dim for better representational capacity
                 'num_layers': 4,
                 'training_steps': 10000,      # More training = better feature quality
                 'features_per_class': 300     # More synthetic features per tail class
@@ -244,9 +244,9 @@ class MemoryConditionedOrchestrator:
             img_num_per_cls.append(int(num))
         
         selected_indices = []
+        np.random.seed(42)
         for cls_idx, num_samples in enumerate(img_num_per_cls):
             indices = class_indices[cls_idx]
-            np.random.seed(42)
             np.random.shuffle(indices)
             selected_indices.extend(indices[:num_samples])
         
@@ -356,16 +356,16 @@ class MemoryConditionedOrchestrator:
             inputs, labels = inputs.to(self.device), labels.to(self.device)
             
             self.optimizer.zero_grad()
-            outputs = self.model(inputs)
+            outputs, features = self.model(inputs, return_features=True)
             loss = self.criterion(labels, outputs, epoch)
             
             loss.backward()
             self.optimizer.step()
             
-            # Update memory bank
+            # Update memory bank directly using already-extracted features (no extra forward pass)
             with torch.no_grad():
-                _, features = self.model(inputs, return_features=True)
-                self.memory_manager.update_memory(inputs, labels)
+                for i in range(len(labels)):
+                    self.memory_manager.memory_bank.update(labels[i].item(), features[i].detach())
             
             train_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
@@ -1007,7 +1007,7 @@ class MemoryConditionedOrchestrator:
             
             # Check improvement threshold
             if improvement['tail'] < self.config['generation']['tail_improvement_threshold']:
-                print(f"\nImprovement below threshold ({improvement['tail']:.2f}% < {self.config['generation']['tail_improvement_threshold']*100:.1f}%)")
+                print(f"\nImprovement below threshold ({improvement['tail']:.2f}% < {self.config['generation']['tail_improvement_threshold']:.1f}%)")
                 print("Stopping iterative improvement.")
                 # break  # Optionally continue even if small improvement
                 # For now, we'll continue to see if later rounds help more, or uncomment break to be strict
