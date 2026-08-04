@@ -12,21 +12,34 @@ import json
 from datetime import datetime
 from pathlib import Path
 
+from pipeline_config import get_default_config, get_test_config, merge_config
+from dataloaders.cifar_lt_loader import get_num_classes
+
+# Windows defaults stdout to cp1252 when it is redirected to a file, which cannot encode the
+# status glyphs used below; without this, piping a run to a log file crashes on the first print.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+
 def get_python_executable():
     """Get the correct python executable, preferring local venv."""
     # Base path relative to this script
     base_dir = Path(__file__).parent.resolve()
     
-    # Check for local venv in current directory
-    local_venv = base_dir / '.venv' / 'Scripts' / 'python.exe'
-    if local_venv.exists():
-        return str(local_venv)
+    # Windows keeps the interpreter in Scripts/, POSIX in bin/
+    relative_paths = [
+        Path('.venv') / 'Scripts' / 'python.exe',
+        Path('.venv') / 'bin' / 'python',
+        Path('venv') / 'Scripts' / 'python.exe',
+        Path('venv') / 'bin' / 'python',
+    ]
     
-    # Check for venv in parent directory
-    parent_venv = base_dir.parent / '.venv' / 'Scripts' / 'python.exe'
-    if parent_venv.exists():
-        return str(parent_venv)
-        
+    for root in (base_dir, base_dir.parent):
+        for relative in relative_paths:
+            candidate = root / relative
+            if candidate.exists():
+                return str(candidate)
+    
     return sys.executable
 
 PYTHON_EXE = get_python_executable()
@@ -42,152 +55,92 @@ except subprocess.CalledProcessError:
 except Exception as e:
     print(f"⚠️ Warning: Error verifying Python executable: {e}")
 
-def run_quick_test():
-    """Run a quick test with minimal configuration."""
-    print("🚀 Running Quick Test Mode...")
-    print("This will run a small-scale test to verify the pipeline works.")
-    
-    config = {
-        'dataset': {
-            'name': 'CIFAR10',
-            'imbalance_ratio': 10,  # Smaller imbalance for testing
-            'num_classes': 10,
-            'batch_size': 32,        # Smaller batch for testing
-            'num_workers': 2
-        },
-        'model': {
-            'architecture': 'ResNet32',
-            'feature_dim': 512,  # ResNet34 features
-            'num_classes': 10
-        },
-        'memory_bank': {
-            'capacity_per_class': 64,  # Smaller capacity for testing
-            'alpha_base': 0.1,
-            'tail_threshold_percentile': 30.0,
-            'update_interval': 50
-        },
-        'training': {
-            'initial_epochs': 2,        # Very few epochs for testing
-            'synthetic_epochs': 1,      # Minimal synthetic training
-            'lr': 0.1,
-            'momentum': 0.9,
-            'weight_decay': 5e-4,
-            'scheduler_milestones': [5, 8],
-            'scheduler_gamma': 0.1
-        },
-        'generation': {
-            'num_prompts_per_tail_class': 5,     # Few prompts for testing
-            'images_per_prompt': 2,               # Few images per prompt
-            'generation_rounds': 1,               # Single round for testing
-            'tail_improvement_threshold': 0.01,
-            'option3_temperature': 0.8,
-            'use_blip': True,
-            'use_clip': True
-        },
-        'ddpm': {
-            'enabled': False,  # Disable for quick test
-            'num_timesteps': 100,
-            'beta_schedule': 'cosine',
-            'hidden_dim': 128,
-            'num_layers': 2,
-            'training_steps': 100,
-            'features_per_class': 10
-        },
-        'paths': {
-            'checkpoint_dir': './test_checkpoints',
-            'memory_dir': './test_memory',
-            'prompts_dir': './test_prompts',
-            'images_dir': './test_images',
-            'features_dir': './test_features',
-            'logs_dir': './test_logs',
-            'results_dir': './test_results'
-        }
-    }
-    
-    # Save config
-    config_path = 'test_config.json'
+def _write_config(config, config_path):
+    """Persist a config next to the run so results are reproducible."""
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
+    print(f"Config written to: {config_path}")
+    return config_path
+
+
+def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
+    """
+    Build a config for one benchmark.
+
+    The class count follows from the dataset, and the backbone follows from the resolution it
+    is trained at: CIFAR-10 at 32x32 needs the small-image ResNet, CIFAR-100 at the CSL
+    setup's 224x224 needs ResNet50. Deriving both here means a run cannot be started with a
+    model that disagrees with its data.
+    """
+    num_classes = get_num_classes(dataset)
+    dataset_section = {'name': dataset, 'num_classes': num_classes}
+    if imbalance is not None:
+        dataset_section['imbalance_ratio'] = imbalance
+
+    config = merge_config({
+        'dataset': dataset_section,
+        'model': {
+            'num_classes': num_classes,
+            'architecture': arch or ('ResNet32' if dataset == 'cifar10' else 'ResNet50'),
+        },
+    })
+
+    return merge_config(overrides, base=config)
+
+
+def run_quick_test():
+    """Run a quick smoke test that exercises every stage of the pipeline."""
+    print("🚀 Running Quick Test Mode...")
+    print("Small-scale run to verify the pipeline works end to end.")
+    print("Stable Diffusion is skipped; the feature-space DDPM path still runs.")
     
-    # Run orchestrator
-    subprocess.run([PYTHON_EXE, 'orchestrator.py', '--config', config_path, '--rounds', '1'])
+    config_path = _write_config(get_test_config(), 'test_config.json')
+    return subprocess.run(
+        [PYTHON_EXE, 'orchestrator.py', '--config', config_path, '--rounds', '1']
+    ).returncode
 
 
 def run_full_training():
-    """Run full training with optimal settings."""
+    """Run full training with optimal settings on the chosen benchmark."""
+    parser = argparse.ArgumentParser(description='Full training run')
+    parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
+                       help='Long-tailed benchmark to run on (default: cifar10)')
+    parser.add_argument('--arch', choices=['ResNet32', 'ResNet50'], default=None,
+                       help='Backbone; defaults to the one matching the dataset resolution')
+    parser.add_argument('--imbalance', type=int, default=None,
+                       help='Imbalance ratio (default: the config value, 100)')
+    parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
+    args = parser.parse_args(sys.argv[2:])  # Skip 'run.py full'
+    
     print("🔥 Running Full Training Mode...")
     print("This will run the complete pipeline with optimal settings.")
     
-    config = {
-        'dataset': {
-            'name': 'CIFAR10',
-            'imbalance_ratio': 10,       # Moderate imbalance — enough tail samples for good prototypes
-            'num_classes': 10,
-            'batch_size': 128,
-            'num_workers': 4
-        },
-        'model': {
-            'architecture': 'ResNet32',
-            'feature_dim': 512,  # ResNet34 features
-            'num_classes': 10
-        },
-        'memory_bank': {
-            'capacity_per_class': 256,
-            'alpha_base': 0.1,
-            'tail_threshold_percentile': 30.0,
-            'update_interval': 100
-        },
-        'training': {
-            'initial_epochs': 200,        # ResNet-34 needs ~200 epochs on CIFAR-10
-            'synthetic_epochs': 25,       # Enough to integrate synthetic features
-            'lr': 0.1,
-            'momentum': 0.9,
-            'weight_decay': 5e-4,
-            'scheduler_milestones': [160, 180],  # Decay at 80% and 90% of total
-            'scheduler_gamma': 0.1
-        },
-        'generation': {
-            'num_prompts_per_tail_class': 50,
-            'images_per_prompt': 4,
-            'generation_rounds': 3,
-            'tail_improvement_threshold': 2.0,
-            'option3_temperature': 0.8,
-            'use_blip': True,
-            'use_clip': True
-        },
-        'ddpm': {
-            'enabled': True,
-            'num_timesteps': 1000,
-            'beta_schedule': 'cosine',
-            'hidden_dim': 1024,           # 2x feature_dim for better capacity
-            'num_layers': 4,
-            'training_steps': 10000,      # More training = better feature quality
-            'features_per_class': 300     # More synthetic features per tail class
-        },
-        'paths': {
-            'checkpoint_dir': './checkpoints',
-            'memory_dir': './memory_checkpoints',
-            'prompts_dir': './prompts',
-            'images_dir': './synthetic_images',
-            'features_dir': './synthetic_features',
-            'logs_dir': './logs',
-            'results_dir': './results'
-        }
-    }
+    config = _dataset_config(args.dataset, args.arch, args.imbalance)
+    print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
+    print(f"  Backbone: {config['model']['architecture']}")
+    print(f"  Imbalance ratio: {config['dataset']['imbalance_ratio']}")
     
-    # Save config
-    config_path = f'full_config_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-    with open(config_path, 'w') as f:
-        json.dump(config, f, indent=2)
+    config_path = _write_config(
+        config, f'full_config_{args.dataset}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
     
-    # Run orchestrator
-    subprocess.run([PYTHON_EXE, 'orchestrator.py', '--config', config_path, '--rounds', '3'])
+    rounds = str(config['generation']['generation_rounds'])
+    return subprocess.run([
+        PYTHON_EXE, 'orchestrator.py',
+        '--config', config_path,
+        '--rounds', rounds,
+        '--gpu', str(args.gpu)
+    ]).returncode
 
 
 def run_custom():
     """Run with custom settings."""
     parser = argparse.ArgumentParser(description='Custom run configuration')
     
+    parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
+                       help='Long-tailed benchmark to run on (default: cifar10)')
+    parser.add_argument('--arch', choices=['ResNet32', 'ResNet50'], default=None,
+                       help='Backbone; defaults to ResNet32 for cifar10 and ResNet50 for '
+                            'cifar100, matching the resolution each is trained at')
     parser.add_argument('--imbalance', type=int, default=100,
                        help='Imbalance ratio (default: 100)')
     parser.add_argument('--epochs', type=int, default=20,
@@ -200,14 +153,37 @@ def run_custom():
                        help='Prompts per tail class (default: 50)')
     parser.add_argument('--images', type=int, default=4,
                        help='Images per prompt (default: 4)')
-    parser.add_argument('--ddpm', action='store_true',
-                       help='Enable DDPM feature generation')
+    parser.add_argument('--ddpm', action='store_true', default=True,
+                       help='Enable DDPM feature generation (default: on)')
+    parser.add_argument('--no-ddpm', dest='ddpm', action='store_false',
+                       help='Disable DDPM feature generation')
+    parser.add_argument('--no-stable-diffusion', dest='stable_diffusion',
+                       action='store_false', default=True,
+                       help='Skip Stable Diffusion image synthesis (much faster)')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU device ID (default: 0)')
     
     args = parser.parse_args(sys.argv[2:])  # Skip 'run.py custom'
     
+    # Build a real config so custom runs get the same defaults as the full run, rather than
+    # the orchestrator's bare-argument path.
+    config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides={
+        'training': {
+            'initial_epochs': args.epochs,
+            'synthetic_epochs': args.synthetic_epochs
+        },
+        'generation': {
+            'num_prompts_per_tail_class': args.prompts,
+            'images_per_prompt': args.images,
+            'generation_rounds': args.rounds,
+            'use_stable_diffusion': args.stable_diffusion
+        },
+        'ddpm': {'enabled': args.ddpm}
+    })
+    
     print(f"🎯 Running with custom settings:")
+    print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
+    print(f"  Backbone: {config['model']['architecture']}")
     print(f"  Imbalance ratio: {args.imbalance}")
     print(f"  Initial epochs: {args.epochs}")
     print(f"  Synthetic epochs: {args.synthetic_epochs}")
@@ -215,22 +191,19 @@ def run_custom():
     print(f"  Prompts per class: {args.prompts}")
     print(f"  Images per prompt: {args.images}")
     print(f"  DDPM enabled: {args.ddpm}")
+    print(f"  Stable Diffusion enabled: {args.stable_diffusion}")
     print(f"  GPU: {args.gpu}")
     
+    config_path = _write_config(
+        config,
+        f'custom_config_{args.dataset}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
     
-    cmd = [
+    return subprocess.run([
         PYTHON_EXE, 'orchestrator.py',
-        '--imbalance-ratio', str(args.imbalance),
-        '--initial-epochs', str(args.epochs),
-        '--synthetic-epochs', str(args.synthetic_epochs),
+        '--config', config_path,
         '--rounds', str(args.rounds),
         '--gpu', str(args.gpu)
-    ]
-    
-    if args.ddpm:
-        cmd.append('--use-ddpm')
-    
-    subprocess.run(cmd)
+    ]).returncode
 
 
 def show_status():
@@ -273,11 +246,20 @@ def show_status():
                 with open(latest_report, 'r') as f:
                     report = json.load(f)
                 
+                if 'summary' in report:
+                    summary = report['summary']
+                    print(f"\n{'Group':<12}{'Before':>12}{'After':>12}{'Change':>12}")
+                    for label, key in [('Overall', 'overall'), ('Tail', 'tail_group'),
+                                       ('Head', 'head_group')]:
+                        print(f"{label:<12}{summary['before_synthetic'][key]:>11.2f}%"
+                              f"{summary['after_synthetic'][key]:>11.2f}%"
+                              f"{summary['delta'][key]:>+11.2f}")
+                
                 if 'improvements' in report:
-                    print("\nTail Class Improvements:")
+                    print("\nPer-class change:")
                     for cls_name, data in report['improvements'].items():
-                        print(f"  {cls_name}: {data['initial']:.2f}% → {data['final']:.2f}% "
-                              f"(+{data['improvement']:.2f}%)")
+                        print(f"  {cls_name:<12}: {data['initial']:.2f}% → {data['final']:.2f}% "
+                              f"({data['improvement']:+.2f} pp)")
 
 
 def clean_outputs():
@@ -316,32 +298,38 @@ def main():
     
     if len(sys.argv) < 2:
         print("\nUsage:")
-        print("  python run.py test      - Run quick test (2 epochs, minimal data)")
+        print("  python run.py test      - Run quick test (few epochs, minimal data)")
         print("  python run.py full      - Run full training (complete pipeline)")
         print("  python run.py custom    - Run with custom settings")
-        print("  python run.py benchmark - Run benchmarks on multiple datasets")
+        print("  python run.py benchmark - Run CSL baselines on multiple datasets")
         print("  python run.py status    - Show current training status")
         print("  python run.py clean     - Clean all output directories")
-        print("\nExample:")
-        print("  python run.py test")
+        print("\nExamples:")
+        print("  python run.py full --dataset cifar10  --imbalance 100")
+        print("  python run.py full --dataset cifar100 --imbalance 100")
+        print("  python run.py custom --dataset cifar100 --epochs 30 --gpu 1")
         print("  python run.py benchmark --datasets cifar10 cifar100")
-        print("  python run.py custom --epochs 30 --ddpm --gpu 1")
+        print("\nThe dataset sets the class count, input resolution and backbone:")
+        print("  cifar10  -> 10 classes,  32x32,  ResNet32")
+        print("  cifar100 -> 100 classes, 224x224, ResNet50")
         sys.exit(1)
     
     command = sys.argv[1].lower()
     
+    # Every training command returns the child's exit status so that an unattended run which
+    # failed is reported as a failure rather than as a success.
     if command == 'test':
-        run_quick_test()
+        return run_quick_test()
     elif command == 'full':
-        run_full_training()
+        return run_full_training()
     elif command == 'custom':
-        run_custom()
+        return run_custom()
     elif command == 'benchmark':
         # Delegate to benchmark_runner.py with remaining args
         benchmark_args = sys.argv[2:]  # pass everything after 'benchmark'
         cmd = [PYTHON_EXE, 'benchmark_runner.py'] + benchmark_args
         print(f"Running: {' '.join(cmd)}")
-        subprocess.run(cmd)
+        return subprocess.run(cmd).returncode
     elif command == 'status':
         show_status()
     elif command == 'clean':
@@ -349,8 +337,10 @@ def main():
     else:
         print(f"❌ Unknown command: {command}")
         print("Valid commands: test, full, custom, benchmark, status, clean")
-        sys.exit(1)
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

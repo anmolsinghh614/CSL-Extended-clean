@@ -20,7 +20,9 @@ class MemoryBank:
                  capacity_per_class: int = 256,
                  alpha_base: float = 0.1,
                  tail_threshold_percentile: float = 20.0,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 tail_refresh_interval: int = 512,
+                 history_limit: int = 200):
         """
         Initialize the memory bank.
         
@@ -31,6 +33,12 @@ class MemoryBank:
             alpha_base: Base learning rate for EMA updates
             tail_threshold_percentile: Percentile below which classes are considered "tail"
             device: Device to store tensors on
+            tail_refresh_interval: Number of samples between tail/head reclassifications.
+                Reclassification is a percentile computation over all classes, so doing it
+                once per sample dominates training time on large datasets.
+            history_limit: Maximum number of history entries retained per class. Without a
+                cap this grows to one dict per observed sample, which makes long runs leak
+                memory and produces unusably large checkpoints.
         """
         self.num_classes = num_classes
         self.feature_dim = feature_dim
@@ -38,18 +46,24 @@ class MemoryBank:
         self.alpha_base = alpha_base
         self.tail_threshold_percentile = tail_threshold_percentile
         self.device = device
+        self.tail_refresh_interval = max(1, tail_refresh_interval)
+        self.history_limit = max(0, history_limit)
         
         # Initialize EMA prototypes for each class
         self.ema_prototypes = torch.zeros(num_classes, feature_dim, device=device)
-        self.ema_counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+        
+        # Counters stay on CPU: they are only ever read as Python scalars, and keeping them
+        # on the accelerator forces a host sync on every training batch.
+        self.ema_counts = torch.zeros(num_classes, dtype=torch.long)
         
         # Initialize Reservoir buffers for each class
         self.reservoir_buffers = {i: [] for i in range(num_classes)}
-        self.reservoir_counts = torch.zeros(num_classes, dtype=torch.long, device=device)
+        self.reservoir_counts = torch.zeros(num_classes, dtype=torch.long)
         
         # Class frequency tracking for adaptive alpha
-        self.class_frequencies = torch.zeros(num_classes, dtype=torch.long, device=device)
+        self.class_frequencies = torch.zeros(num_classes, dtype=torch.long)
         self.total_samples = 0
+        self._samples_since_refresh = 0
         
         # Tail class identification
         self.tail_classes = set()
@@ -80,17 +94,18 @@ class MemoryBank:
     
     def _get_adaptive_alpha(self, class_id: int) -> float:
         """Get adaptive alpha based on class frequency."""
-        if self.class_frequencies[class_id] == 0:
+        frequency = int(self.class_frequencies[class_id])
+        if frequency == 0:
             return self.alpha_base
             
         # Calculate class frequency ratio
-        freq_ratio = self.class_frequencies[class_id] / max(self.total_samples, 1)
+        freq_ratio = frequency / max(self.total_samples, 1)
         
         # Adaptive alpha: lower for head classes (more stable), higher for tail classes (faster adaptation)
         adaptive_alpha = self.alpha_base * (1.0 / (freq_ratio + 1e-6))
         
         # Clamp to reasonable bounds
-        return torch.clamp(adaptive_alpha, 0.01, 0.5).item()
+        return float(np.clip(adaptive_alpha, 0.01, 0.5))
     
     def update(self, class_id: int, feature: torch.Tensor) -> None:
         """
@@ -112,42 +127,119 @@ class MemoryBank:
         
         # Update EMA prototype
         alpha = self._get_adaptive_alpha(class_id)
-        if self.ema_counts[class_id] == 0:
+        self._apply_ema(class_id, feature, alpha)
+        
+        # Update Reservoir buffer
+        self._update_reservoir(class_id, feature.detach().cpu())
+        
+        self._record_history(class_id, alpha, float(torch.norm(feature)))
+        self._maybe_refresh_tail_classification(1)
+    
+    def update_batch(self, labels: torch.Tensor, features: torch.Tensor) -> None:
+        """
+        Update the memory bank with a whole batch of features at once.
+        
+        This is the path used by the training loop. Updating sample-by-sample means one
+        prototype write, one host transfer and one percentile recomputation per image,
+        which costs more than the forward/backward pass it accompanies.
+        
+        Args:
+            labels: Class labels [batch_size]
+            features: Feature vectors [batch_size, feature_dim]
+        """
+        if features.dim() != 2 or features.shape[0] == 0:
+            return
+        
+        features = features.detach()
+        labels = labels.detach().to(torch.long)
+        
+        # Single L2 normalization for the whole batch
+        normalized = torch.nn.functional.normalize(features, p=2, dim=1)
+        
+        # One host transfer for the batch instead of one per sample
+        labels_cpu = labels.cpu()
+        normalized_cpu = normalized.cpu()
+        
+        batch_size = labels_cpu.shape[0]
+        counts = torch.bincount(labels_cpu, minlength=self.num_classes)
+        
+        # Frequencies must be current before alpha is derived from them
+        self.class_frequencies += counts
+        self.total_samples += batch_size
+        
+        for class_id in torch.nonzero(counts, as_tuple=False).flatten().tolist():
+            if not (0 <= class_id < self.num_classes):
+                continue
+            
+            mask = labels_cpu == class_id
+            class_features = normalized[mask.to(normalized.device)]
+            num_in_batch = int(counts[class_id])
+            
+            alpha = self._get_adaptive_alpha(class_id)
+            # Applying the per-sample EMA num_in_batch times with the batch mean as the
+            # incoming feature collapses to a single update with this effective rate.
+            effective_alpha = 1.0 - (1.0 - alpha) ** num_in_batch
+            self._apply_ema(class_id, class_features.mean(dim=0), effective_alpha,
+                            increment=num_in_batch)
+            
+            for feature in normalized_cpu[mask]:
+                self._update_reservoir(class_id, feature)
+            
+            self._record_history(class_id, alpha, float(torch.norm(class_features[0])))
+        
+        self._maybe_refresh_tail_classification(batch_size)
+    
+    def _apply_ema(self, class_id: int, feature: torch.Tensor, alpha: float,
+                   increment: int = 1) -> None:
+        """Blend a feature into a class prototype with the given EMA rate."""
+        feature = feature.to(self.ema_prototypes.device)
+        if int(self.ema_counts[class_id]) == 0:
             # First feature for this class
             self.ema_prototypes[class_id] = feature
         else:
             # EMA update: M_c ← (1 - α) * M_c + α * feature
             self.ema_prototypes[class_id] = (1 - alpha) * self.ema_prototypes[class_id] + alpha * feature
         
-        self.ema_counts[class_id] += 1
+        self.ema_counts[class_id] += increment
+    
+    def _record_history(self, class_id: int, alpha: float, feature_norm: float) -> None:
+        """Append a capped history entry for later analysis."""
+        if self.history_limit == 0:
+            return
         
-        # Update Reservoir buffer
-        self._update_reservoir(class_id, feature)
-        
-        # Update tail class identification
-        self._update_tail_classification()
-        
-        # Track update history for analysis
-        self.update_history[class_id].append({
+        history = self.update_history[class_id]
+        history.append({
             'step': self.total_samples,
             'alpha': alpha,
-            'feature_norm': torch.norm(feature).item()
+            'feature_norm': feature_norm
         })
+        if len(history) > self.history_limit:
+            del history[:-self.history_limit]
+    
+    def _maybe_refresh_tail_classification(self, num_samples: int) -> None:
+        """Recompute tail/head/medium membership once enough new samples have arrived."""
+        self._samples_since_refresh += num_samples
+        if self._samples_since_refresh >= self.tail_refresh_interval or not self.tail_classes:
+            self._samples_since_refresh = 0
+            self._update_tail_classification()
     
     def _update_reservoir(self, class_id: int, feature: torch.Tensor) -> None:
-        """Update Reservoir buffer for a class using Reservoir sampling."""
+        """Update Reservoir buffer for a class using Reservoir sampling.
+        
+        Expects `feature` to already live on the CPU.
+        """
         self.reservoir_counts[class_id] += 1
-        n = self.reservoir_counts[class_id]
+        n = int(self.reservoir_counts[class_id])
         
         if len(self.reservoir_buffers[class_id]) < self.capacity_per_class:
             # Buffer not full yet, just append
-            self.reservoir_buffers[class_id].append(feature.detach().cpu())
+            self.reservoir_buffers[class_id].append(feature)
         else:
             # Reservoir sampling: replace with probability K/n
             if torch.rand(1).item() < self.capacity_per_class / n:
                 # Randomly select position to replace
                 replace_idx = torch.randint(0, self.capacity_per_class, (1,)).item()
-                self.reservoir_buffers[class_id][replace_idx] = feature.detach().cpu()
+                self.reservoir_buffers[class_id][replace_idx] = feature
     
     def _update_tail_classification(self) -> None:
         """Update tail/head/medium class classification based on current frequencies."""
@@ -164,9 +256,9 @@ class MemoryBank:
         head_threshold = np.percentile(class_percentages, 100 - self.tail_threshold_percentile)
         tail_threshold = np.percentile(class_percentages, self.tail_threshold_percentile)
         
-        # Classify classes
-        self.head_classes = set(sorted_indices[class_percentages[sorted_indices] >= head_threshold])
-        self.tail_classes = set(sorted_indices[class_percentages[sorted_indices] <= tail_threshold])
+        # Classify classes (plain ints so downstream JSON serialization stays simple)
+        self.head_classes = {int(c) for c in sorted_indices[class_percentages[sorted_indices] >= head_threshold]}
+        self.tail_classes = {int(c) for c in sorted_indices[class_percentages[sorted_indices] <= tail_threshold]}
         self.medium_classes = set(range(self.num_classes)) - self.head_classes - self.tail_classes
     
     def get_prototype(self, class_id: int) -> torch.Tensor:
@@ -353,57 +445,54 @@ class MemoryBank:
         plt.show()
     
     def save(self, filepath: str) -> None:
-        """Save memory bank to disk."""
-        def convert_numpy_types(obj):
-            """Convert numpy types to Python native types for JSON serialization."""
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, list):
-                return [convert_numpy_types(item) for item in obj]
-            elif isinstance(obj, dict):
-                return {key: convert_numpy_types(value) for key, value in obj.items()}
-            else:
-                return obj
+        """Save memory bank to disk.
         
+        Uses torch serialization rather than JSON: the reservoir holds
+        num_classes × capacity_per_class × feature_dim floats, which as text is tens of
+        megabytes per checkpoint and seconds of encoding time per save.
+        """
         save_data = {
             'num_classes': self.num_classes,
             'feature_dim': self.feature_dim,
             'capacity_per_class': self.capacity_per_class,
             'alpha_base': self.alpha_base,
             'tail_threshold_percentile': self.tail_threshold_percentile,
-            'ema_prototypes': self.ema_prototypes.cpu().numpy().tolist(),
-            'ema_counts': self.ema_counts.cpu().numpy().tolist(),
-            'reservoir_counts': self.reservoir_counts.cpu().numpy().tolist(),
-            'class_frequencies': self.class_frequencies.cpu().numpy().tolist(),
+            'ema_prototypes': self.ema_prototypes.detach().cpu(),
+            'ema_counts': self.ema_counts.cpu(),
+            'reservoir_counts': self.reservoir_counts.cpu(),
+            'class_frequencies': self.class_frequencies.cpu(),
             'total_samples': self.total_samples,
-            'tail_classes': list(self.tail_classes),
-            'head_classes': list(self.head_classes),
-            'medium_classes': list(self.medium_classes),
-            'update_history': dict(self.update_history)
+            'tail_classes': sorted(int(c) for c in self.tail_classes),
+            'head_classes': sorted(int(c) for c in self.head_classes),
+            'medium_classes': sorted(int(c) for c in self.medium_classes),
+            'update_history': {int(k): v for k, v in self.update_history.items()},
+            'reservoir_buffers': {
+                int(class_id): (torch.stack(buffer) if buffer else torch.empty(0, self.feature_dim))
+                for class_id, buffer in self.reservoir_buffers.items()
+            }
         }
         
-        # Convert reservoir buffers to lists for JSON serialization
-        save_data['reservoir_buffers'] = {}
-        for class_id, buffer in self.reservoir_buffers.items():
-            if buffer:
-                save_data['reservoir_buffers'][str(class_id)] = [f.cpu().numpy().tolist() for f in buffer]
-            else:
-                save_data['reservoir_buffers'][str(class_id)] = []
-        
-        # Convert all numpy types to Python native types
-        save_data = convert_numpy_types(save_data)
-        
+        torch.save(save_data, filepath)
+    
+    def save_summary(self, filepath: str) -> None:
+        """Write a small human-readable JSON summary alongside the tensor checkpoint."""
+        total = max(self.total_samples, 1)
+        summary = {
+            'total_samples': self.total_samples,
+            'tail_classes': sorted(int(c) for c in self.tail_classes),
+            'medium_classes': sorted(int(c) for c in self.medium_classes),
+            'head_classes': sorted(int(c) for c in self.head_classes),
+            'class_frequencies': [int(c) for c in self.class_frequencies],
+            'class_percentages': [round(float(c) / total * 100, 4) for c in self.class_frequencies],
+            'prototype_norms': [round(float(n), 4) for n in torch.norm(self.ema_prototypes, dim=1)],
+            'reservoir_fill': {int(c): len(b) for c, b in self.reservoir_buffers.items()}
+        }
         with open(filepath, 'w') as f:
-            json.dump(save_data, f, indent=2)
+            json.dump(summary, f, indent=2)
     
     def load(self, filepath: str) -> None:
         """Load memory bank from disk."""
-        with open(filepath, 'r') as f:
-            save_data = json.load(f)
+        save_data = torch.load(filepath, map_location='cpu', weights_only=False)
         
         # Restore basic parameters
         self.num_classes = save_data['num_classes']
@@ -412,17 +501,18 @@ class MemoryBank:
         self.alpha_base = save_data['alpha_base']
         self.tail_threshold_percentile = save_data['tail_threshold_percentile']
         
-        # Convert lists back to numpy arrays and then to tensors
-        self.ema_prototypes = torch.from_numpy(np.array(save_data['ema_prototypes'])).to(self.device)
-        self.ema_counts = torch.from_numpy(np.array(save_data['ema_counts'])).to(self.device)
-        self.reservoir_counts = torch.from_numpy(np.array(save_data['reservoir_counts'])).to(self.device)
-        self.class_frequencies = torch.from_numpy(np.array(save_data['class_frequencies'])).to(self.device)
+        # Prototypes live on the compute device; counters stay on the CPU (see __init__).
+        self.ema_prototypes = save_data['ema_prototypes'].to(dtype=torch.float32, device=self.device)
+        self.ema_counts = save_data['ema_counts'].to(torch.long)
+        self.reservoir_counts = save_data['reservoir_counts'].to(torch.long)
+        self.class_frequencies = save_data['class_frequencies'].to(torch.long)
         self.total_samples = save_data['total_samples']
+        self._samples_since_refresh = 0
         
         # Restore sets
-        self.tail_classes = set(save_data['tail_classes'])
-        self.head_classes = set(save_data['head_classes'])
-        self.medium_classes = set(save_data['medium_classes'])
+        self.tail_classes = {int(c) for c in save_data['tail_classes']}
+        self.head_classes = {int(c) for c in save_data['head_classes']}
+        self.medium_classes = {int(c) for c in save_data['medium_classes']}
         
         # Restore update history
         self.update_history = defaultdict(list)
@@ -431,12 +521,9 @@ class MemoryBank:
         
         # Restore reservoir buffers
         self.reservoir_buffers = {i: [] for i in range(self.num_classes)}
-        for class_id_str, buffer_list in save_data['reservoir_buffers'].items():
-            class_id = int(class_id_str)
-            if len(buffer_list) > 0:
-                self.reservoir_buffers[class_id] = [torch.from_numpy(np.array(f)) for f in buffer_list]
-            else:
-                self.reservoir_buffers[class_id] = []
+        for class_id, buffer in save_data['reservoir_buffers'].items():
+            buffer = buffer.to(torch.float32)
+            self.reservoir_buffers[int(class_id)] = [row for row in buffer] if buffer.numel() else []
     
     def get_memory_usage(self) -> Dict:
         """Get memory usage statistics."""

@@ -37,12 +37,33 @@ class VisualExemplarPromptGenerator:
     captions using BLIP for semantic prompt generation.
     """
     
+    # Photographic modifiers used to expand a caption into many distinct prompts.
+    PROMPT_MODIFIERS = [
+        "high resolution photograph",
+        "sharp focus, natural lighting",
+        "daylight, outdoors",
+        "close-up view",
+        "wide shot, plain background",
+        "overcast day",
+        "side view",
+        "front view",
+        "detailed texture",
+        "soft shadows",
+        "clear background",
+        "golden hour lighting",
+    ]
+    
     def __init__(self,
                  memory_manager,
                  clip_model_name: str = "ViT-B/32",
                  blip_model_name: str = "Salesforce/blip-image-captioning-base",
                  device: str = "cuda",
-                 cache_dir: str = "./clip_cache"):
+                 cache_dir: str = "./clip_cache",
+                 pixel_mean: Tuple[float, float, float] = (0.4914, 0.4822, 0.4465),
+                 pixel_std: Tuple[float, float, float] = (0.2023, 0.1994, 0.2010),
+                 use_blip: bool = True,
+                 use_clip: bool = True,
+                 require_models: bool = False):
         """
         Initialize the visual exemplar prompt generator.
         
@@ -52,33 +73,94 @@ class VisualExemplarPromptGenerator:
             blip_model_name: BLIP model for captioning
             device: Device for computation
             cache_dir: Directory to cache CLIP embeddings
+            pixel_mean: Normalization mean used by the classifier's transform, needed to
+                recover displayable pixels before handing images to CLIP/BLIP
+            pixel_std: Normalization std used by the classifier's transform
+            use_blip: Whether to load BLIP for exemplar captioning
+            use_clip: Whether to load CLIP for prompt ranking
+            require_models: Raise if the captioning/ranking models cannot be loaded.
+                When False the generator degrades to class-name templates instead, so a
+                missing optional dependency cannot abort a training run.
         """
         self.memory_manager = memory_manager
         self.device = device
         self.cache_dir = cache_dir
+        self.pixel_mean = torch.tensor(pixel_mean).view(3, 1, 1)
+        self.pixel_std = torch.tensor(pixel_std).view(3, 1, 1)
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Check if models are available
-        if not MODELS_AVAILABLE:
+        if not MODELS_AVAILABLE and require_models:
             raise ImportError("Required models not available. Please install CLIP and transformers.")
         
-        # Load CLIP model
-        self.clip_model, self.clip_preprocess = clip.load(clip_model_name, device=device)
-        self.clip_model.eval()
+        self.clip_model = None
+        self.clip_preprocess = None
+        self.blip_processor = None
+        self.blip_model = None
         
-        # Load BLIP model for captioning
-        self.blip_processor = BlipProcessor.from_pretrained(blip_model_name)
-        self.blip_model = BlipForConditionalGeneration.from_pretrained(blip_model_name)
-        self.blip_model = self.blip_model.to(device)
-        self.blip_model.eval()
+        if MODELS_AVAILABLE and use_clip:
+            try:
+                self.clip_model, self.clip_preprocess = clip.load(clip_model_name, device=device)
+                self.clip_model.eval()
+                print(f"Loaded CLIP model: {clip_model_name}")
+            except Exception as e:
+                if require_models:
+                    raise
+                print(f"Warning: could not load CLIP ({e}). Prompt ranking disabled.")
+                self.clip_model = None
+        
+        if MODELS_AVAILABLE and use_blip:
+            try:
+                self.blip_processor = BlipProcessor.from_pretrained(blip_model_name)
+                self.blip_model = BlipForConditionalGeneration.from_pretrained(blip_model_name)
+                self.blip_model = self.blip_model.to(device)
+                self.blip_model.eval()
+                print(f"Loaded BLIP model: {blip_model_name}")
+            except Exception as e:
+                if require_models:
+                    raise
+                print(f"Warning: could not load BLIP ({e}). Exemplar captioning disabled.")
+                self.blip_model = None
         
         # Storage for image data and embeddings
         self.image_database = {}  # class_id -> List[ImageExemplar]
         self.clip_embeddings_cache = {}  # image_path -> clip_embedding
         
-        print(f"Loaded CLIP model: {clip_model_name}")
-        print(f"Loaded BLIP model: {blip_model_name}")
+    @property
+    def captioning_available(self) -> bool:
+        return self.blip_model is not None
+    
+    @property
+    def ranking_available(self) -> bool:
+        return self.clip_model is not None
+    
+    def _tensor_to_pil(self, image: torch.Tensor, upscale_to: int = 224):
+        """
+        Convert a normalized CHW image tensor into a PIL image.
         
+        Args:
+            image: Image tensor, optionally with a leading batch dimension
+            upscale_to: Side length to resize to. CLIP and BLIP are trained on ~224px
+                inputs, so passing 32x32 tensors straight through yields poor captions.
+        """
+        if image.dim() == 4:
+            image = image.squeeze(0)
+        if image.dim() != 3 or image.shape[0] != 3:
+            return None
+        
+        image = image.detach().float().cpu()
+        
+        # Undo the classifier's normalization when the tensor is still normalized
+        if image.min() < 0:
+            image = image * self.pixel_std + self.pixel_mean
+        
+        image = torch.clamp(image, 0, 1)
+        image_pil = Image.fromarray((image.permute(1, 2, 0) * 255).numpy().astype(np.uint8))
+        
+        if upscale_to and image_pil.size[0] < upscale_to:
+            image_pil = image_pil.resize((upscale_to, upscale_to), Image.BICUBIC)
+        
+        return image_pil
+    
     def build_image_database(self, 
                            dataloader,
                            max_images_per_class: int = 1000,
@@ -153,24 +235,13 @@ class VisualExemplarPromptGenerator:
         if image_path in self.clip_embeddings_cache:
             return self.clip_embeddings_cache[image_path]
         
+        if not self.ranking_available:
+            return None
+        
         try:
-            # Prepare image for CLIP
-            if image.dim() == 4:  # Batch dimension
-                image = image.squeeze(0)
-            
-            # Convert to PIL if needed for CLIP preprocessing
-            if image.shape[0] == 3:  # RGB
-                # Denormalize if normalized (assume ImageNet normalization)
-                if image.min() < 0:  # Likely normalized
-                    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
-                    std = torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
-                    image = image * std + mean
-                
-                # Clamp to [0, 1] and convert to PIL
-                image = torch.clamp(image, 0, 1)
-                image_pil = Image.fromarray((image.permute(1, 2, 0) * 255).numpy().astype(np.uint8))
-            else:
-                print(f"Warning: Unexpected image shape {image.shape}")
+            image_pil = self._tensor_to_pil(image)
+            if image_pil is None:
+                print(f"Warning: Unexpected image shape {tuple(image.shape)}")
                 return None
             
             # Preprocess and encode with CLIP
@@ -190,42 +261,206 @@ class VisualExemplarPromptGenerator:
             return None
     
     
-    def generate_prompts(self, 
-                    class_idx: int,
-                    exemplar_features: torch.Tensor,  # Add this parameter
-                    num_prompts: int = 5,
-                    temperature: float = 0.8) -> List[str]:
-        """
-         Generate semantic prompts for a single tail class.
+    CIFAR10_CLASS_NAMES = {
+        0: 'airplane', 1: 'automobile', 2: 'bird', 3: 'cat', 4: 'deer',
+        5: 'dog', 6: 'frog', 7: 'horse', 8: 'ship', 9: 'truck'
+    }
     
+    def generate_prompts(self,
+                         class_idx: int,
+                         exemplar_features: torch.Tensor = None,
+                         num_prompts: int = 5,
+                         temperature: float = 0.8,
+                         class_name: str = None) -> List[str]:
+        """
+        Generate class-name template prompts for a single class.
+        
+        This is the fallback used when no exemplar images are available. Prefer
+        `generate_prompts_from_exemplars`, which conditions the prompts on the images the
+        memory bank actually selected.
+        
         Args:
-        class_idx: Class ID to generate prompts for
-        exemplar_features: Exemplar features from memory bank
-        num_prompts: Number of prompts to generate
-        temperature: Temperature parameter (unused in this version)
-    
+            class_idx: Class ID to generate prompts for
+            exemplar_features: Unused here; accepted for backward compatibility
+            num_prompts: Number of prompts to return
+            temperature: Unused here; accepted for backward compatibility
+            class_name: Human-readable class name (falls back to the CIFAR-10 names)
+        
         Returns:
-        List of prompts for the class
+            List of prompts for the class
         """
-        class_names = {
-            0: 'airplane', 1: 'automobile', 2: 'bird', 3: 'cat', 4: 'deer',
-            5: 'dog', 6: 'frog', 7: 'horse', 8: 'ship', 9: 'truck'
-        }
-    
-        class_name = class_names.get(class_idx, f"class_{class_idx}")
-    
-    # Generate prompts based on class name
-        prompts = [
+        if class_name is None:
+            class_name = self.CIFAR10_CLASS_NAMES.get(class_idx, f"class_{class_idx}")
+        
+        base_prompts = [
             f"a photo of a {class_name}",
             f"a high quality image of a {class_name}",
-            f"{class_name}",
             f"a clear photograph of a {class_name}",
-            f"a {class_name} in natural setting",
-            f"detailed view of a {class_name}",
-            f"a {class_name} shown clearly"
+            f"a {class_name} in a natural setting",
+            f"a detailed view of a {class_name}",
         ]
+        
+        return self._expand_to_count(base_prompts, class_name, num_prompts)
     
-        return prompts[:num_prompts]
+    def generate_prompts_from_exemplars(self,
+                                        class_idx: int,
+                                        class_name: str,
+                                        exemplar_images: List[torch.Tensor],
+                                        num_prompts: int = 5,
+                                        temperature: float = 0.8) -> Tuple[List[str], List[str]]:
+        """
+        Generate prompts conditioned on the class's nearest visual exemplars.
+        
+        This is the Option 3 path: the memory bank prototype selects which real training
+        images best represent the class, BLIP describes those images, and CLIP scores the
+        resulting prompt candidates against the exemplars so the prompts that survive are
+        the ones that actually look like the class.
+        
+        Args:
+            class_idx: Class ID
+            class_name: Human-readable class name
+            exemplar_images: Normalized image tensors chosen as this class's exemplars
+            num_prompts: Number of prompts to return
+            temperature: Controls how much of the ranked candidate pool is sampled from.
+                0 keeps strictly the top-scoring prompts; higher values sample more widely
+                for diversity.
+        
+        Returns:
+            (prompts, captions) — the selected prompts and the raw exemplar captions
+        """
+        captions = []
+        if self.captioning_available:
+            for image in exemplar_images:
+                caption = self._generate_blip_caption(image)
+                if caption:
+                    captions.append(caption.strip().lower())
+        
+        candidates = self._build_prompt_candidates(class_name, captions)
+        
+        if not candidates:
+            return self.generate_prompts(class_idx, num_prompts=num_prompts,
+                                         class_name=class_name), captions
+        
+        ranked = self._rank_prompts_by_clip(candidates, exemplar_images, temperature)
+        selected = ranked[:num_prompts]
+        
+        if len(selected) < num_prompts:
+            selected = self._expand_to_count(selected, class_name, num_prompts)
+        
+        return selected, captions
+    
+    def _build_prompt_candidates(self, class_name: str, captions: List[str]) -> List[str]:
+        """Build a deduplicated candidate pool from exemplar captions plus templates."""
+        candidates = [
+            f"a photo of a {class_name}",
+            f"a high quality photograph of a {class_name}",
+            f"a clear detailed photo of a {class_name}",
+            f"a {class_name} in a natural setting",
+        ]
+        
+        for caption in captions:
+            descriptors = self._extract_descriptors(caption, class_name)
+            
+            # Anchor every caption-derived prompt on the class name: BLIP captions of
+            # 32x32 images are often vague, and an unanchored prompt can drift to a
+            # different object entirely, which would poison the synthetic samples.
+            if class_name in caption:
+                candidates.append(f"a photo of {caption}")
+            else:
+                candidates.append(f"a photo of a {class_name}, {caption}")
+            
+            if descriptors:
+                candidates.append(f"a photo of a {class_name}, {descriptors}")
+                for modifier in self.PROMPT_MODIFIERS:
+                    candidates.append(f"a photo of a {class_name}, {descriptors}, {modifier}")
+        
+        for modifier in self.PROMPT_MODIFIERS:
+            candidates.append(f"a photo of a {class_name}, {modifier}")
+        
+        return self._deduplicate(candidates)
+    
+    def _expand_to_count(self, prompts: List[str], class_name: str, num_prompts: int) -> List[str]:
+        """Pad a prompt list up to num_prompts by appending photographic modifiers."""
+        expanded = list(prompts)
+        
+        for modifier in self.PROMPT_MODIFIERS:
+            if len(expanded) >= num_prompts:
+                break
+            expanded.append(f"a photo of a {class_name}, {modifier}")
+        
+        # Still short (a very large num_prompts): cycle modifiers over existing prompts
+        modifier_idx = 0
+        while len(expanded) < num_prompts and prompts:
+            base = prompts[modifier_idx % len(prompts)]
+            modifier = self.PROMPT_MODIFIERS[modifier_idx % len(self.PROMPT_MODIFIERS)]
+            expanded.append(f"{base}, {modifier}")
+            modifier_idx += 1
+            if modifier_idx > num_prompts * 4:
+                break
+        
+        return self._deduplicate(expanded)[:num_prompts]
+    
+    @staticmethod
+    def _deduplicate(prompts: List[str]) -> List[str]:
+        """Remove duplicates while preserving order."""
+        seen = set()
+        unique = []
+        for prompt in prompts:
+            key = prompt.strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(prompt.strip())
+        return unique
+    
+    def _rank_prompts_by_clip(self,
+                              candidates: List[str],
+                              exemplar_images: List[torch.Tensor],
+                              temperature: float = 0.0) -> List[str]:
+        """
+        Order candidate prompts by CLIP similarity to the exemplar images.
+        
+        Falls back to the original ordering when CLIP is unavailable or no exemplar
+        image could be embedded.
+        """
+        if not self.ranking_available or not exemplar_images:
+            return candidates
+        
+        try:
+            image_embeddings = []
+            for image in exemplar_images:
+                image_pil = self._tensor_to_pil(image)
+                if image_pil is None:
+                    continue
+                image_input = self.clip_preprocess(image_pil).unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    embedding = self.clip_model.encode_image(image_input)
+                image_embeddings.append(F.normalize(embedding.float(), dim=1))
+            
+            if not image_embeddings:
+                return candidates
+            
+            image_centroid = F.normalize(torch.cat(image_embeddings).mean(dim=0, keepdim=True), dim=1)
+            
+            tokens = clip.tokenize(candidates, truncate=True).to(self.device)
+            with torch.no_grad():
+                text_embeddings = self.clip_model.encode_text(tokens)
+            text_embeddings = F.normalize(text_embeddings.float(), dim=1)
+            
+            scores = (text_embeddings @ image_centroid.T).squeeze(1)
+            
+            if temperature and temperature > 0:
+                # Sample without replacement, weighted by similarity, so repeated rounds
+                # do not regenerate the exact same prompt set.
+                weights = torch.softmax(scores / max(temperature, 1e-3), dim=0)
+                order = torch.multinomial(weights, num_samples=len(candidates), replacement=False)
+            else:
+                order = torch.argsort(scores, descending=True)
+            
+            return [candidates[i] for i in order.tolist()]
+        
+        except Exception as e:
+            print(f"Warning: CLIP prompt ranking failed ({e}). Using unranked candidates.")
+            return candidates
     
     
     def find_nearest_exemplars_for_tail_classes(self, 
@@ -376,22 +611,12 @@ class VisualExemplarPromptGenerator:
     
     def _generate_blip_caption(self, image: torch.Tensor) -> Optional[str]:
         """Generate caption for a single image using BLIP."""
+        if not self.captioning_available:
+            return None
+        
         try:
-            # Prepare image for BLIP
-            if image.dim() == 4:
-                image = image.squeeze(0)
-            
-            # Convert to PIL
-            if image.shape[0] == 3:  # RGB
-                # Denormalize if needed
-                if image.min() < 0:
-                    mean = torch.tensor([0.4914, 0.4822, 0.4465]).view(3, 1, 1)
-                    std = torch.tensor([0.2023, 0.1994, 0.2010]).view(3, 1, 1)
-                    image = image * std + mean
-                
-                image = torch.clamp(image, 0, 1)
-                image_pil = Image.fromarray((image.permute(1, 2, 0) * 255).numpy().astype(np.uint8))
-            else:
+            image_pil = self._tensor_to_pil(image)
+            if image_pil is None:
                 return None
             
             # Generate caption with BLIP
@@ -472,25 +697,31 @@ class VisualExemplarPromptGenerator:
         
         return semantic_prompts
     
+    STOPWORDS = {'the', 'and', 'with', 'that', 'this', 'there', 'its', 'his', 'her',
+                 'are', 'was', 'were', 'has', 'have', 'for', 'from', 'into', 'onto'}
+    
     def _extract_descriptors(self, caption: str, class_name: str) -> str:
         """Extract descriptive phrases from caption."""
+        caption = caption.strip().lower()
+        
         # Remove common prefixes
-        prefixes = ["a photo of", "an image of", "a picture of", "this is"]
+        prefixes = ["a photo of", "an image of", "a picture of", "this is", "there is"]
         for prefix in prefixes:
             if caption.startswith(prefix):
                 caption = caption[len(prefix):].strip()
         
-        # Remove class name to get descriptors
         class_name_lower = class_name.lower()
-        words = caption.split()
-        
-        # Find descriptive words that aren't the class name
         descriptors = []
-        for word in words:
-            if word not in class_name_lower and len(word) > 2:
-                descriptors.append(word)
+        for word in caption.split():
+            word = word.strip('.,;:!?"\'')
+            if len(word) <= 2 or word in self.STOPWORDS:
+                continue
+            # Drop the class name itself; it is already anchored in the prompt template
+            if word == class_name_lower or word == f"{class_name_lower}s":
+                continue
+            descriptors.append(word)
         
-        return " ".join(descriptors[:5])  # Limit to 5 descriptive words
+        return " ".join(descriptors[:6])
     
     def save_prompts_json(self, 
                          semantic_prompts: Dict[int, List[str]],
@@ -503,7 +734,8 @@ class VisualExemplarPromptGenerator:
                 'method': 'Visual Exemplar + BLIP Captioning (Option 3)',
                 'num_tail_classes': len(semantic_prompts),
                 'total_prompts': sum(len(prompts) for prompts in semantic_prompts.values()),
-                'clip_model': self.clip_model.visual.conv1.weight.shape,  # Model fingerprint
+                'clip_available': self.ranking_available,
+                'blip_available': self.captioning_available,
             },
             'prompts': {}
         }

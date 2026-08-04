@@ -18,7 +18,8 @@ class MemoryManager:
                  alpha_base: float = 0.1,
                  tail_threshold_percentile: float = 20.0,
                  device: str = 'cpu',
-                 save_dir: str = './memory_checkpoints'):
+                 save_dir: str = './memory_checkpoints',
+                 tail_refresh_interval: int = 512):
         """
         Initialize the memory manager.
         
@@ -30,6 +31,7 @@ class MemoryManager:
             tail_threshold_percentile: Percentile for tail class identification
             device: Device to use for computations
             save_dir: Directory to save memory checkpoints
+            tail_refresh_interval: Samples between tail/head reclassifications
         """
         self.model = model
         self.device = device
@@ -49,7 +51,8 @@ class MemoryManager:
             capacity_per_class=capacity_per_class,
             alpha_base=alpha_base,
             tail_threshold_percentile=tail_threshold_percentile,
-            device=device
+            device=device,
+            tail_refresh_interval=tail_refresh_interval
         )
         
         # Statistics tracking
@@ -77,25 +80,35 @@ class MemoryManager:
         """
         Update memory bank with features from a batch.
         
+        Only use this when features are not already available; it runs an extra forward
+        pass. Training loops should call `update_memory_from_features` with the features
+        produced by the pass they already did.
+        
         Args:
             inputs: Input images [batch_size, channels, height, width]
             labels: Class labels [batch_size]
         """
         with torch.no_grad():
-            # Extract features and logits
-            outputs, features = self.model(inputs, return_features=True)
+            _, features = self.model(inputs, return_features=True)
+            self.update_memory_from_features(labels, features)
+    
+    def update_memory_from_features(self, labels: torch.Tensor, features: torch.Tensor) -> None:
+        """
+        Update memory bank with features that have already been extracted.
+        
+        Args:
+            labels: Class labels [batch_size]
+            features: Feature vectors [batch_size, feature_dim]
+        """
+        with torch.no_grad():
+            self.memory_bank.update_batch(labels, features)
             
-            # Update memory bank for each sample
-            for i in range(len(labels)):
-                class_id = labels[i].item()
-                feature = features[i]
-                
-                # Update memory bank
-                self.memory_bank.update(class_id, feature)
-                
-                # Update statistics
-                self.update_stats['total_updates'] += 1
-                self.update_stats['updates_per_class'][class_id] += 1
+            counts = torch.bincount(labels.detach().cpu().to(torch.long),
+                                    minlength=self.memory_bank.num_classes)
+            self.update_stats['total_updates'] += int(counts.sum())
+            for class_id, count in enumerate(counts.tolist()):
+                if count:
+                    self.update_stats['updates_per_class'][class_id] += count
     
     def get_tail_classes(self) -> List[int]:
         """Get list of tail class IDs."""
@@ -152,14 +165,17 @@ class MemoryManager:
         Returns:
             Path to saved file
         """
-        filename = f"{prefix}_step_{step}.json"
+        filename = f"{prefix}_step_{step}.pt"
         filepath = os.path.join(self.save_dir, filename)
         
         # Save memory bank
         self.memory_bank.save(filepath)
         
+        # Save a readable summary of the bank next to the tensor checkpoint
+        self.memory_bank.save_summary(filepath.replace('.pt', '_summary.json'))
+        
         # Save training statistics
-        stats_filepath = filepath.replace('.json', '_stats.json')
+        stats_filepath = filepath.replace('.pt', '_stats.json')
         with open(stats_filepath, 'w') as f:
             json.dump(self.update_stats, f, indent=2)
         
@@ -171,7 +187,7 @@ class MemoryManager:
         self.memory_bank.load(filepath)
         
         # Try to load training statistics
-        stats_filepath = filepath.replace('.json', '_stats.json')
+        stats_filepath = filepath.replace('.pt', '_stats.json')
         if os.path.exists(stats_filepath):
             with open(stats_filepath, 'r') as f:
                 self.update_stats = json.load(f)
@@ -183,7 +199,7 @@ class MemoryManager:
         
         # Find all memory files
         memory_files = [f for f in os.listdir(self.save_dir) 
-                       if f.startswith(prefix) and f.endswith('.json') and 'stats' not in f]
+                       if f.startswith(prefix) and f.endswith('.pt')]
         
         if not memory_files:
             return None

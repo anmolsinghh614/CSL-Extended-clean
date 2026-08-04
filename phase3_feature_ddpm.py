@@ -59,24 +59,39 @@ class FeatureDDPM(nn.Module):
         
         # ========== Noise Schedule ==========
         if beta_schedule == 'cosine':
-            self.betas = self._cosine_beta_schedule(num_timesteps)
+            betas = self._cosine_beta_schedule(num_timesteps)
         else:
-            self.betas = self._linear_beta_schedule(num_timesteps)
+            betas = self._linear_beta_schedule(num_timesteps)
         
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1, 0), value=1.0)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
         
-        # Precompute values for closed form
-        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / self.alphas)
-        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        # Register every schedule tensor as a buffer so it follows the module to the
+        # compute device; indexing a CPU-resident schedule with device-resident timesteps
+        # forces a host sync on every one of the thousands of reverse-diffusion steps.
+        self.register_buffer('betas', betas)
+        self.register_buffer('alphas', alphas)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1.0 - alphas_cumprod))
+        self.register_buffer('sqrt_recip_alphas', torch.sqrt(1.0 / alphas))
+        self.register_buffer(
+            'posterior_variance',
+            betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
+        )
         
-        # Register as buffers (move to GPU automatically)
-        self.register_buffer('betas_buffer', self.betas)
-        self.register_buffer('sqrt_alphas_cumprod_buffer', self.sqrt_alphas_cumprod)
-        self.register_buffer('sqrt_one_minus_alphas_cumprod_buffer', self.sqrt_one_minus_alphas_cumprod)
+        # ========== Feature standardization ==========
+        # The diffusion forward process assumes roughly zero-mean, unit-variance data.
+        # Raw penultimate ResNet activations are post-ReLU (non-negative, with per-dimension
+        # scales in the tens), so training directly on them makes the model's noise
+        # predictions meaningless. These buffers hold the statistics used to map real
+        # features into the diffusion space and generated samples back out; they default to
+        # the identity transform so an unconfigured model behaves as before.
+        self.register_buffer('feature_mean', torch.zeros(feature_dim))
+        self.register_buffer('feature_std', torch.ones(feature_dim))
+        self.register_buffer('features_are_non_negative', torch.tensor(False))
         
         # ========== Noise Prediction Network ε_θ ==========
         # Timestep embedding
@@ -162,11 +177,43 @@ class FeatureDDPM(nn.Module):
         
         return sqrt_alphas_cumprod_t * f_0 + sqrt_one_minus_alphas_cumprod_t * noise
     
+    def set_feature_stats(self, features: torch.Tensor, non_negative: bool = True) -> None:
+        """
+        Fit the standardization statistics from a sample of real features.
+        
+        Args:
+            features: Real features [num_samples, feature_dim]
+            non_negative: Whether the source features are post-ReLU. When True, generated
+                samples are clamped at zero so they stay on the real feature manifold.
+        """
+        features = features.detach().to(torch.float32)
+        mean = features.mean(dim=0)
+        std = features.std(dim=0)
+        # Dead feature dimensions have zero variance; leaving them at zero would divide by
+        # ~0 and turn tiny numerical noise into enormous inputs.
+        std = torch.where(std < 1e-4, torch.ones_like(std), std)
+        
+        self.feature_mean = mean.to(self.feature_mean.device)
+        self.feature_std = std.to(self.feature_std.device)
+        self.features_are_non_negative = torch.tensor(bool(non_negative),
+                                                      device=self.features_are_non_negative.device)
+    
+    def standardize(self, features: torch.Tensor) -> torch.Tensor:
+        """Map real features into the diffusion space."""
+        return (features - self.feature_mean) / self.feature_std
+    
+    def destandardize(self, features: torch.Tensor) -> torch.Tensor:
+        """Map generated samples back into the real feature space."""
+        features = features * self.feature_std + self.feature_mean
+        if bool(self.features_are_non_negative):
+            features = features.clamp_min(0.0)
+        return features
+    
     def _extract(self, a, t, x_shape):
         """Extract values from a based on timestep t"""
         batch_size = t.shape[0]
-        out = a.gather(-1, t.cpu())
-        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1))).to(t.device)
+        out = a.to(t.device).gather(-1, t)
+        return out.reshape(batch_size, *((1,) * (len(x_shape) - 1)))
     
     def predict_noise(self, f_t, t, class_ids):
         """
@@ -206,6 +253,9 @@ class FeatureDDPM(nn.Module):
         batch_size = f_0.shape[0]
         device = f_0.device
         
+        # Work in the standardized space the noise schedule assumes
+        f_0 = self.standardize(f_0)
+        
         # Sample random timesteps for each sample in batch
         t = torch.randint(0, self.num_timesteps, (batch_size,), device=device, dtype=torch.long)
         
@@ -224,105 +274,154 @@ class FeatureDDPM(nn.Module):
         return loss
     
     @torch.no_grad()
-    def p_sample(self, f_t, t, class_ids):
+    def p_sample(self, f_t, t, t_prev, class_ids, eta=0.0, clip_denoised=4.0):
         """
-        Single reverse diffusion step
-        Sample from p(f_{t-1} | f_t)
+        Single reverse step from timestep t to timestep t_prev.
+        
+        Uses the generalized DDIM update, which is valid for any gap between t and t_prev.
+        The ancestral DDPM update is only correct for t_prev = t - 1; applying it across a
+        strided schedule under-removes noise at every step and the samples diverge.
         
         Args:
             f_t: Current noisy features [batch_size, feature_dim]
             t: Current timestep [batch_size]
+            t_prev: Target timestep [batch_size]; negative values mean "fully denoised"
             class_ids: Class labels [batch_size]
+            eta: 0 gives deterministic DDIM, 1 reproduces the DDPM posterior variance
+            clip_denoised: Clamp the predicted clean sample to this many standard deviations.
+                Without it a single bad noise prediction compounds over the remaining steps.
         
         Returns:
-            f_{t-1}: Less noisy features
+            f_{t_prev}: Less noisy features
         """
-        betas_t = self._extract(self.betas, t, f_t.shape)
-        sqrt_one_minus_alphas_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, f_t.shape)
-        sqrt_recip_alphas_t = self._extract(self.sqrt_recip_alphas, t, f_t.shape)
+        alpha_bar_t = self._extract(self.alphas_cumprod, t, f_t.shape)
         
-        # Predict noise
-        predicted_noise = self.predict_noise(f_t, t, class_ids)
-        
-        # Compute mean of p(f_{t-1} | f_t)
-        model_mean = sqrt_recip_alphas_t * (
-            f_t - betas_t * predicted_noise / sqrt_one_minus_alphas_cumprod_t
+        # t_prev < 0 denotes the clean sample, where the cumulative product is 1
+        safe_prev = t_prev.clamp_min(0)
+        alpha_bar_prev = torch.where(
+            (t_prev < 0).reshape(-1, *((1,) * (f_t.dim() - 1))),
+            torch.ones_like(alpha_bar_t),
+            self._extract(self.alphas_cumprod, safe_prev, f_t.shape)
         )
         
-        if t[0] > 0:
-            # Add noise (except at t=0)
-            posterior_variance_t = self._extract(self.posterior_variance, t, f_t.shape)
-            noise = torch.randn_like(f_t)
-            return model_mean + torch.sqrt(posterior_variance_t) * noise
-        else:
-            return model_mean
+        predicted_noise = self.predict_noise(f_t, t, class_ids)
+        
+        # Recover the implied clean sample
+        f_0_pred = (f_t - torch.sqrt(1.0 - alpha_bar_t) * predicted_noise) / torch.sqrt(alpha_bar_t)
+        if clip_denoised:
+            f_0_pred = f_0_pred.clamp(-clip_denoised, clip_denoised)
+        
+        sigma = eta * torch.sqrt(
+            (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t).clamp_min(1e-8)
+        ) * torch.sqrt((1.0 - alpha_bar_t / alpha_bar_prev.clamp_min(1e-8)).clamp_min(0.0))
+        
+        direction = torch.sqrt((1.0 - alpha_bar_prev - sigma ** 2).clamp_min(0.0)) * predicted_noise
+        f_prev = torch.sqrt(alpha_bar_prev) * f_0_pred + direction
+        
+        if eta > 0:
+            f_prev = f_prev + sigma * torch.randn_like(f_t)
+        
+        return f_prev
     
     @torch.no_grad()
-    def sample(self, class_ids, device='cuda'):
+    def sample(self, class_ids, device='cuda', num_steps=None, eta=0.0):
         """
         Generate synthetic features via reverse diffusion
         
         Args:
             class_ids: [batch_size] class labels to generate
             device: Device to use
+            num_steps: Optional number of reverse steps. Defaults to the full schedule;
+                a smaller value strides the schedule for faster sampling.
+            eta: Stochasticity of the sampler (0 = deterministic DDIM)
         
         Returns:
-            f_0: Generated clean features [batch_size, feature_dim]
+            f_0: Generated clean features [batch_size, feature_dim], in real feature space
         """
         batch_size = len(class_ids)
+        class_ids = class_ids.to(device)
+        
+        if num_steps is None or num_steps >= self.num_timesteps:
+            timesteps = list(range(self.num_timesteps - 1, -1, -1))
+        else:
+            timesteps = torch.linspace(
+                self.num_timesteps - 1, 0, max(1, int(num_steps))
+            ).round().to(torch.long).tolist()
         
         # Start from pure Gaussian noise
         f_t = torch.randn(batch_size, self.feature_dim, device=device)
         
-        # Reverse diffusion process
-        for i in reversed(range(self.num_timesteps)):
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            f_t = self.p_sample(f_t, t, class_ids)
+        for step_idx, timestep in enumerate(timesteps):
+            prev_timestep = timesteps[step_idx + 1] if step_idx + 1 < len(timesteps) else -1
+            t = torch.full((batch_size,), timestep, device=device, dtype=torch.long)
+            t_prev = torch.full((batch_size,), prev_timestep, device=device, dtype=torch.long)
+            f_t = self.p_sample(f_t, t, t_prev, class_ids, eta=eta)
         
-        return f_t
+        return self.destandardize(f_t)
     
     @torch.no_grad()
-    def sample_with_confidence(self, class_ids, class_prototypes, device='cuda'):
+    def sample_batched(self, class_ids, device='cuda', num_steps=None, batch_size=256, eta=0.0):
+        """
+        Generate features in chunks so large requests do not blow up memory.
+        
+        Args:
+            class_ids: [num_samples] class labels
+            device: Device to use
+            num_steps: Optional number of reverse steps
+            batch_size: Maximum samples generated per reverse-diffusion pass
+            eta: Stochasticity of the sampler
+        
+        Returns:
+            features: [num_samples, feature_dim] in real feature space
+        """
+        class_ids = class_ids.to(device)
+        chunks = []
+        for start in range(0, len(class_ids), batch_size):
+            chunks.append(self.sample(class_ids[start:start + batch_size], device, num_steps, eta))
+        
+        if not chunks:
+            return torch.empty(0, self.feature_dim, device=device)
+        return torch.cat(chunks, dim=0)
+    
+    @torch.no_grad()
+    def sample_with_confidence(self, class_ids, class_prototypes, device='cuda',
+                               num_steps=None, batch_size=256, eta=0.0):
         """
         Generate features and compute confidence scores
+        
+        Confidence is the cosine similarity between a generated feature and its class
+        prototype, rescaled to [0, 1]. It is used to discard samples that fall outside the
+        real feature distribution before they are trained on.
         
         Args:
             class_ids: [batch_size] class labels
             class_prototypes: Dict[class_id -> prototype tensor]
             device: Device to use
+            num_steps: Optional number of reverse steps
+            batch_size: Maximum samples generated per reverse-diffusion pass
         
         Returns:
             features: [batch_size, feature_dim]
             confidences: [batch_size] confidence scores [0, 1]
         """
-        # Generate features
-        features = self.sample(class_ids, device)
+        class_ids = class_ids.to(device)
+        features = self.sample_batched(class_ids, device, num_steps, batch_size, eta)
         
-        # Compute confidence as cosine similarity to class prototype
-        confidences = []
-        for i, class_id in enumerate(class_ids):
-            prototype = class_prototypes[class_id.item()].to(device)
-            feat = features[i]
-            
-            # Normalize vectors
-            feat_norm = F.normalize(feat.unsqueeze(0), dim=1)
-            proto_norm = F.normalize(prototype.unsqueeze(0), dim=1)
-            
-            # Cosine similarity [-1, 1]
-            similarity = (feat_norm * proto_norm).sum()
-            
-            # Map to [0, 1]
-            confidence = (similarity + 1) / 2
-            confidences.append(confidence)
+        # Stack prototypes into a lookup table so confidence is one batched operation
+        prototype_table = torch.zeros(self.num_classes, self.feature_dim, device=device)
+        for class_id, prototype in class_prototypes.items():
+            prototype_table[int(class_id)] = prototype.detach().to(device).flatten()
         
-        confidences = torch.stack(confidences)
+        prototypes = prototype_table[class_ids]
+        similarity = F.cosine_similarity(features, prototypes, dim=1)
+        confidences = (similarity + 1) / 2
         
         return features, confidences
     
     @torch.no_grad()
     def sample_fast(self, class_ids, num_steps=50, device='cuda'):
         """
-        Fast sampling using DDIM (fewer steps)
+        Fast sampling using a strided subset of the noise schedule (DDIM).
         
         Args:
             class_ids: [batch_size] class labels
@@ -332,17 +431,7 @@ class FeatureDDPM(nn.Module):
         Returns:
             f_0: Generated features [batch_size, feature_dim]
         """
-        # Select subset of timesteps
-        timesteps = torch.linspace(0, self.num_timesteps - 1, num_steps, dtype=torch.long, device=device)
-        
-        batch_size = len(class_ids)
-        f_t = torch.randn(batch_size, self.feature_dim, device=device)
-        
-        for i in reversed(range(len(timesteps))):
-            t = timesteps[i].repeat(batch_size)
-            f_t = self.p_sample(f_t, t, class_ids)
-        
-        return f_t
+        return self.sample(class_ids, device=device, num_steps=num_steps)
 
 
 if __name__ == "__main__":

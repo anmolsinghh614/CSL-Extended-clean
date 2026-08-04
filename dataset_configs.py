@@ -32,10 +32,13 @@ DATASET_CONFIGS = {
     'cifar100': {
         'name': 'CIFAR-100-LT',
         'num_classes': 100,
-        'image_size': 32,
-        'norm_mean': [0.5071, 0.4867, 0.4408],
-        'norm_std': [0.2675, 0.2565, 0.2761],
-        'backbone': 'ResNet32',
+        # The CSL CIFAR-100 setup upsamples to ImageNet resolution and rescales by (0.5, 0.5)
+        # rather than using per-channel CIFAR-100 statistics. Kept as-is so accuracies stay
+        # comparable to the published baseline; see dataloaders/cifar_lt_loader.py.
+        'image_size': 224,
+        'norm_mean': [0.5, 0.5, 0.5],
+        'norm_std': [0.5, 0.5, 0.5],
+        'backbone': 'ResNet50',
         'epochs': 200,
         'lr': 0.1,
         'lr_decay_epochs': [160, 180],

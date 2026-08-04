@@ -1,3 +1,7 @@
+# On Windows, `pip install torch` installs the CPU-only build and the pipeline will silently
+# train on CPU. For a GPU machine install the CUDA build first, then the rest of this file:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Verify with: python -c "import torch; print(torch.cuda.is_available())"
 torch
 torchvision
 numpy

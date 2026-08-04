@@ -1,73 +1,87 @@
-# System & IDE
+# The rule here: anything the code regenerates stays out, anything needed to reproduce a run
+# goes in. So source, configs-as-defaults and the dataset index files are tracked, while
+# downloaded datasets, checkpoints, generated images/features and run outputs are not.
+
+# ── System & IDE ──────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
+env/
 .env
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
 
-# Datasets
+# ── Datasets (downloaded on first run) ────────────────────────────────────────
 data/
+datasets/
 balanced_dataset/
+*.tar.gz
+*.zip
 
-# Model Checkpoints & Weights
-*.pth
+# ── Model checkpoints & weights ───────────────────────────────────────────────
 *.pt
+*.pth
+*.ckpt
+*.safetensors
 checkpoints/
 memory_checkpoints/
-test_checkpoints/
-test_memory_checkpoints/
-demo_memory_checkpoints/
 feature_ddpm_checkpoints/
-models/*.pth
-models/*.pt
 
-# Experiment Results & Outputs
+# ── Run outputs (paths from pipeline_config.get_default_config) ───────────────
+logs/
 results/
-test_results/
-full_option3_results/
-option3_test_results/
-test_logs/
+prompts/
+synthetic_features/
+synthetic_images/
+benchmark_results/
+
+# ── Run outputs (test / smoke configurations) ─────────────────────────────────
+test_checkpoints/
 test_memory/
+test_memory_checkpoints/
 test_features/
 test_prompts/
-
-# Generated Images
-generated_images/
-option3_generated_images/
 test_images/
+test_logs/
+test_results/
+_smoke_out/
+_probe_out/
+
+# ── Outputs from earlier experiment scripts ───────────────────────────────────
+demo_memory_checkpoints/
+demo_synthetic_images/
+demo_clip_cache/
+clip_cache/
+full_option3_results/
+option3_test_results/
+option3_generated_images/
+generated_images/
 synthetic_cifar10_images/
 option1_cifar10_images/
-demo_synthetic_images/
 *_images/
 
-# Caches
-clip_cache/
-demo_clip_cache/
+# ── Generated configs ─────────────────────────────────────────────────────────
+# The defaults live in pipeline_config.py; these are per-run snapshots written by run.py.
+test_config.json
+full_config_*.json
+custom_config_*.json
 
-# Generated Reports & Logs
+# ── Reports, logs and figures produced by a run ───────────────────────────────
 *.log
-*_report.json
-*_analysis.json
-*_final.json
-tail_class_analysis_*.json
-training_summary.json
-final_report_*.json
-
-# Visualizations
 *.png
 *.jpg
 *.jpeg
-*_visualization.png
-
-# Large Files & Archives
-*.zip
-*.tar.gz
-Phase 5.1.zip
-et --hard 778f941
-
-# Temporary Generated Configs
-test_config.json
+final_report_*.json
+tail_analysis_*.json
+tail_class_analysis_*.json
+results_visualization_*.json
+training_summary.json
+*_report.json
+*_analysis.json
 *_prompts.json
+*_result.json
+benchmark_summary.json

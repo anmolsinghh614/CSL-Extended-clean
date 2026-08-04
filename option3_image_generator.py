@@ -122,10 +122,10 @@ class Option3ImageGenerator:
                   prompts: List[str],
                   class_idx: int,
                   num_images_per_prompt: int = 1,
-                  batch_size: int = 1,
                   guidance_scale: float = 7.5,
-                  num_inference_steps: int = 50,
-                  image_size: int = 512) -> List[str]:
+                  num_inference_steps: int = 30,
+                  image_size: int = 512,
+                  subdir: Optional[str] = None) -> List[str]:
         """
         Generate batch of images for given prompts.
         
@@ -136,31 +136,46 @@ class Option3ImageGenerator:
             guidance_scale: Guidance scale for generation
             num_inference_steps: Number of diffusion steps
             image_size: Output image size (SD works best at 512)
+            subdir: Optional subdirectory under the output dir (e.g. one per round)
         
         Returns:
             List of paths to generated images
         """
         generated_paths = []
-    
-        for prompt_idx, prompt in enumerate(prompts):
-            for img_idx in range(num_images_per_prompt):
+        
+        target_dir = os.path.join(self.output_dir, subdir) if subdir else self.output_dir
+        os.makedirs(target_dir, exist_ok=True)
+        
+        for prompt in prompts:
+            for _ in range(num_images_per_prompt):
                 # Generate image at SD-native resolution (512×512)
                 # Images are later resized to dataset resolution (e.g. 32×32) during preprocessing
-                image = self.pipeline(
-                    prompt,
-                    height=image_size,
-                    width=image_size,
-                    guidance_scale=guidance_scale,
-                    num_inference_steps=num_inference_steps
-                ).images[0]
-            
-                # Save image
-                filename = f"class{class_idx}_prompt{prompt_idx}_img{img_idx}.png"
-                save_path = os.path.join(self.output_dir, filename)
+                with torch.inference_mode():
+                    image = self.pipeline(
+                        prompt,
+                        height=image_size,
+                        width=image_size,
+                        guidance_scale=guidance_scale,
+                        num_inference_steps=num_inference_steps
+                    ).images[0]
+                
+                # Filenames are keyed off a per-class counter that persists across calls.
+                # Deriving them from the caller's loop indices instead makes every call
+                # restart at zero and silently overwrite the previous call's images.
+                image_index = self._next_image_index(class_idx)
+                save_path = os.path.join(target_dir, f"class{class_idx}_img{image_index:06d}.png")
                 image.save(save_path)
                 generated_paths.append(save_path)
-    
+        
         return generated_paths
+    
+    def _next_image_index(self, class_idx: int) -> int:
+        """Return a monotonically increasing per-class image index."""
+        if not hasattr(self, '_image_counters'):
+            self._image_counters = {}
+        index = self._image_counters.get(class_idx, 0)
+        self._image_counters[class_idx] = index + 1
+        return index
     def _initialize_dalle(self):
         """Initialize DALL-E API."""
         if not OPENAI_AVAILABLE:
@@ -317,10 +332,7 @@ class Option3ImageGenerator:
                     guidance_scale=guidance_scale,
                     generator=torch.Generator(device=self.device).manual_seed(
                         np.random.randint(0, 2**31-1)
-                    ),
-                    # Disable progress bar
-                    callback=None,
-                    callback_steps=None
+                    )
                 )
             
             return result.images[0]

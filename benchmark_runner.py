@@ -26,7 +26,7 @@ from collections import defaultdict
 from models import ResNet18, ResNet32, ResNet50
 from utils import CSLLossFunc
 from dataset_configs import DATASET_CONFIGS, get_dataset_config, get_available_datasets
-from dataloaders import get_cifar100_loaders, get_tiny_imagenet_loaders
+from dataloaders import get_cifar_lt_loaders, get_tiny_imagenet_loaders
 
 
 # ─── Model Factory ───────────────────────────────────────────────────────────
@@ -47,58 +47,6 @@ def create_model(backbone, num_classes, image_size, device):
         image_size=image_size
     )
     return model.to(device)
-
-
-# ─── CIFAR-10-LT Loader (inline like orchestrator) ───────────────────────────
-
-def get_cifar10_loaders(batch_size=128, data_dir='./datasets/CIFAR10',
-                         imbalance_ratio=100, num_workers=4):
-    """CIFAR-10-LT loader with exponential decay imbalance."""
-    num_classes = 10
-
-    transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
-    ])
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.4914, 0.4822, 0.4465], [0.2023, 0.1994, 0.2010])
-    ])
-
-    train_set = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=transform_train)
-    val_set = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=transform_test)
-
-    # Create imbalanced version
-    targets = train_set.targets if hasattr(train_set, 'targets') else [train_set[i][1] for i in range(len(train_set))]
-    class_indices = defaultdict(list)
-    for idx, label in enumerate(targets):
-        class_indices[label].append(idx)
-
-    img_max = max(len(v) for v in class_indices.values())
-    img_num_per_cls = []
-    for cls_idx in range(num_classes):
-        num = img_max * (imbalance_ratio ** (-cls_idx / (num_classes - 1)))
-        img_num_per_cls.append(int(num))
-
-    selected_indices = []
-    for cls_idx in range(num_classes):
-        indices = class_indices[cls_idx]
-        np.random.seed(42)
-        np.random.shuffle(indices)
-        take = min(img_num_per_cls[cls_idx], len(indices))
-        selected_indices.extend(indices[:take])
-        img_num_per_cls[cls_idx] = take
-
-    train_set = Subset(train_set, selected_indices)
-
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False,
-                            num_workers=num_workers, pin_memory=True)
-
-    return train_loader, val_loader, img_num_per_cls
 
 
 # ─── Training Logic ──────────────────────────────────────────────────────────
@@ -204,14 +152,16 @@ def run_benchmark(dataset_name, imbalance_ratio=None, device='cuda',
     print(f"{'='*80}")
 
     # ── Load data ──
-    if dataset_name == 'cifar10':
-        train_loader, val_loader, samples_per_class = get_cifar10_loaders(
-            batch_size=cfg['batch_size'], imbalance_ratio=ir, num_workers=num_workers
+    # Both CIFAR benchmarks share the loader the main pipeline uses, so a baseline number
+    # here and a pipeline number from orchestrator.py are measured on identical data.
+    if dataset_name in ('cifar10', 'cifar100'):
+        bundle = get_cifar_lt_loaders(
+            dataset=dataset_name, batch_size=cfg['batch_size'], imbalance_ratio=ir,
+            num_workers=num_workers, image_size=cfg['image_size']
         )
-    elif dataset_name == 'cifar100':
-        train_loader, val_loader, samples_per_class = get_cifar100_loaders(
-            batch_size=cfg['batch_size'], imbalance_factor=ir, num_workers=num_workers
-        )
+        train_loader = bundle['train_loader']
+        val_loader = bundle['test_loader']
+        samples_per_class = bundle['samples_per_class']
     elif dataset_name == 'tiny_imagenet':
         train_loader, val_loader, samples_per_class = get_tiny_imagenet_loaders(
             batch_size=cfg['batch_size'], imbalance_factor=ir, num_workers=num_workers

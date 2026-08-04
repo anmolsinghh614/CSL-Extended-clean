@@ -23,6 +23,13 @@ class AdditionalTermLayer(nn.Module):
         self.num_classes = num_classes
         self.last_epoch = -1
         
+        # Boolean lookup so per-sample tail membership is a gather instead of a Python loop
+        tail_mask = torch.zeros(num_classes, dtype=torch.bool)
+        for class_id in (target_class_index or []):
+            if 0 <= int(class_id) < num_classes:
+                tail_mask[int(class_id)] = True
+        self.register_buffer('tail_mask', tail_mask)
+        
         # Epoch-level tracking (for monitoring, NOT for gradient computation)
         self.epoch_pred_counts = None
         self.prev_epoch_pred_counts = None
@@ -61,8 +68,9 @@ class AdditionalTermLayer(nn.Module):
         # --- Update prediction tracking (detached, for monitoring only) ---
         with torch.no_grad():
             preds = torch.argmax(inputs, dim=-1)
-            for i in range(self.num_classes):
-                self.epoch_pred_counts[i] += (preds == i).sum().item()
+            self.epoch_pred_counts += torch.bincount(
+                preds, minlength=self.num_classes
+            ).detach().cpu().to(self.epoch_pred_counts.dtype)
 
         # --- Differentiable CSL penalty ---
         # Step 1: Get softmax probabilities (fully differentiable)
@@ -75,25 +83,27 @@ class AdditionalTermLayer(nn.Module):
         # Step 3: Build per-sample weights — tail classes get higher weight
         # This creates a weighting mask (detached — weights themselves don't need grad)
         with torch.no_grad():
-            sample_weights = torch.ones(batch_size, device=inputs.device)
-            for i, label in enumerate(true_labels):
-                label_int = label.item()
-                if label_int in self.target_class_index:
-                    # Tail class: boost weight to encourage correct predictions
-                    sample_weights[i] = 3.0
-                    
-                    # Additional reinforcement: if this tail class was improving
-                    # across epochs, slightly reduce the push (it's learning);
-                    # if it was declining, increase the push
-                    if self.prev_epoch_pred_counts is not None:
-                        prev = self.prev_epoch_pred_counts[label_int]
-                        curr = self.epoch_pred_counts[label_int]
-                        if prev > 0 and curr < prev:
-                            # Tail class predictions declining → push harder
-                            sample_weights[i] = 4.0
-                        elif prev > 0 and curr > prev:
-                            # Tail class predictions improving → moderate push
-                            sample_weights[i] = 2.0
+            is_tail = self.tail_mask.to(inputs.device)[true_labels]  # [B]
+            
+            # Tail class: boost weight to encourage correct predictions
+            sample_weights = torch.where(
+                is_tail,
+                torch.full_like(true_class_probs, 3.0),
+                torch.ones_like(true_class_probs)
+            )
+            
+            # Additional reinforcement: if this tail class was improving across epochs,
+            # slightly reduce the push (it's learning); if it was declining, increase it
+            if self.prev_epoch_pred_counts is not None:
+                prev = self.prev_epoch_pred_counts.to(inputs.device)[true_labels]
+                curr = self.epoch_pred_counts.to(inputs.device)[true_labels]
+                tracked = is_tail & (prev > 0)
+                sample_weights = torch.where(
+                    tracked & (curr < prev), torch.full_like(sample_weights, 4.0), sample_weights
+                )
+                sample_weights = torch.where(
+                    tracked & (curr > prev), torch.full_like(sample_weights, 2.0), sample_weights
+                )
 
         # Step 4: Compute focal-style penalty
         # -log(p_correct) is just CE, but we weight it by (1 - p_correct)

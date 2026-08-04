@@ -301,11 +301,24 @@ Tail Class Improvements:
 
 | Dataset | Classes | Image Size | Loader |
 |---------|---------|-----------|--------|
-| CIFAR-10-LT | 10 | 32×32 | Built-in (torchvision) |
-| CIFAR-100-LT | 100 | 32×32 | `dataloaders/cifar_100_loader.py` |
+| CIFAR-10-LT | 10 | 32×32 | `dataloaders/cifar_lt_loader.py` |
+| CIFAR-100-LT | 100 | 32×32 | `dataloaders/cifar_lt_loader.py` |
 | Tiny ImageNet | 200 | 64×64 | `dataloaders/tiny_imagenet_loader.py` |
 | ImageNet-LT | 1000 | 224×224 | `dataloaders/imagenet_lt_loader.py` |
 | iNaturalist 2018 | 8142 | 224×224 | `dataloaders/inaturalist_loader.py` |
+
+Both CIFAR benchmarks go through the same loader, which reproduces the long-tail profile the
+CSL results are reported against: `n_k = n_max · ratio^(−k/(C−1))`, so class 0 keeps all its
+images and the last class keeps `1/ratio` of them. At the standard `--imbalance 100` that is
+5000→50 images per class for CIFAR-10-LT (12,406 total) and 500→5 for CIFAR-100-LT (10,847
+total). `subset_seed` fixes which images each class keeps so a run can be repeated exactly.
+
+```bash
+python run.py custom --dataset cifar100 --imbalance 100
+```
+
+Selecting a dataset sets the class count for you, so the model can never be built with a
+label count that disagrees with the data.
 
 ---
 
