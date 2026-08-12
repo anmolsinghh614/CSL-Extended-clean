@@ -133,7 +133,14 @@ def run_full_training():
 
 
 def run_custom():
-    """Run with custom settings."""
+    """
+    Run with custom settings.
+
+    Every tunable defaults to None and is only written into the config when it is passed, so
+    an unspecified option keeps its benchmark value from pipeline_config.py. Repeating those
+    values as argparse defaults is how a "custom" run silently stops being comparable to a
+    "full" run: a stale default here would quietly override the protocol.
+    """
     parser = argparse.ArgumentParser(description='Custom run configuration')
     
     parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
@@ -141,57 +148,57 @@ def run_custom():
     parser.add_argument('--arch', choices=['ResNet32', 'ResNet34', 'ResNet50'], default=None,
                        help='Backbone; defaults to the benchmark ResNet32 for both CIFAR '
                             'variants')
-    parser.add_argument('--imbalance', type=int, default=100,
-                       help='Imbalance ratio (default: 100)')
-    parser.add_argument('--epochs', type=int, default=20,
-                       help='Initial training epochs (default: 20)')
-    parser.add_argument('--synthetic-epochs', type=int, default=10,
-                       help='Synthetic training epochs (default: 10)')
-    parser.add_argument('--rounds', type=int, default=3,
-                       help='Number of improvement rounds (default: 3)')
-    parser.add_argument('--prompts', type=int, default=50,
-                       help='Prompts per tail class (default: 50)')
-    parser.add_argument('--images', type=int, default=4,
-                       help='Images per prompt (default: 4)')
-    parser.add_argument('--ddpm', action='store_true', default=True,
-                       help='Enable DDPM feature generation (default: on)')
-    parser.add_argument('--no-ddpm', dest='ddpm', action='store_false',
-                       help='Disable DDPM feature generation')
+    parser.add_argument('--imbalance', type=int, default=None,
+                       help='Imbalance ratio (default: the config value, 100)')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Initial training epochs (default: the config value, 200)')
+    parser.add_argument('--synthetic-epochs', type=int, default=None,
+                       help='Synthetic training epochs (default: the config value, 25)')
+    parser.add_argument('--rounds', type=int, default=None,
+                       help='Number of improvement rounds (default: the config value, 3)')
+    parser.add_argument('--prompts', type=int, default=None,
+                       help='Prompts per tail class (default: the config value, 50)')
+    parser.add_argument('--images', type=int, default=None,
+                       help='Images per prompt (default: the config value, 4)')
+    parser.add_argument('--no-ddpm', dest='ddpm', action='store_false', default=None,
+                       help='Disable DDPM feature generation (default: enabled)')
     parser.add_argument('--no-stable-diffusion', dest='stable_diffusion',
-                       action='store_false', default=True,
+                       action='store_false', default=None,
                        help='Skip Stable Diffusion image synthesis (much faster)')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU device ID (default: 0)')
     
     args = parser.parse_args(sys.argv[2:])  # Skip 'run.py custom'
     
+    def section(**values):
+        return {key: value for key, value in values.items() if value is not None}
+    
     # Build a real config so custom runs get the same defaults as the full run, rather than
     # the orchestrator's bare-argument path.
     config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides={
-        'training': {
-            'initial_epochs': args.epochs,
-            'synthetic_epochs': args.synthetic_epochs
-        },
-        'generation': {
-            'num_prompts_per_tail_class': args.prompts,
-            'images_per_prompt': args.images,
-            'generation_rounds': args.rounds,
-            'use_stable_diffusion': args.stable_diffusion
-        },
-        'ddpm': {'enabled': args.ddpm}
+        'training': section(initial_epochs=args.epochs,
+                            synthetic_epochs=args.synthetic_epochs),
+        'generation': section(num_prompts_per_tail_class=args.prompts,
+                              images_per_prompt=args.images,
+                              generation_rounds=args.rounds,
+                              use_stable_diffusion=args.stable_diffusion),
+        'ddpm': section(enabled=args.ddpm),
     })
+    
+    training = config['training']
+    generation = config['generation']
     
     print(f"🎯 Running with custom settings:")
     print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
     print(f"  Backbone: {config['model']['architecture']}")
-    print(f"  Imbalance ratio: {args.imbalance}")
-    print(f"  Initial epochs: {args.epochs}")
-    print(f"  Synthetic epochs: {args.synthetic_epochs}")
-    print(f"  Improvement rounds: {args.rounds}")
-    print(f"  Prompts per class: {args.prompts}")
-    print(f"  Images per prompt: {args.images}")
-    print(f"  DDPM enabled: {args.ddpm}")
-    print(f"  Stable Diffusion enabled: {args.stable_diffusion}")
+    print(f"  Imbalance ratio: {config['dataset']['imbalance_ratio']}")
+    print(f"  Initial epochs: {training['initial_epochs']}")
+    print(f"  Synthetic epochs: {training['synthetic_epochs']}")
+    print(f"  Improvement rounds: {generation['generation_rounds']}")
+    print(f"  Prompts per class: {generation['num_prompts_per_tail_class']}")
+    print(f"  Images per prompt: {generation['images_per_prompt']}")
+    print(f"  DDPM enabled: {config['ddpm']['enabled']}")
+    print(f"  Stable Diffusion enabled: {generation['use_stable_diffusion']}")
     print(f"  GPU: {args.gpu}")
     
     config_path = _write_config(
@@ -201,7 +208,7 @@ def run_custom():
     return subprocess.run([
         PYTHON_EXE, 'orchestrator.py',
         '--config', config_path,
-        '--rounds', str(args.rounds),
+        '--rounds', str(generation['generation_rounds']),
         '--gpu', str(args.gpu)
     ]).returncode
 
@@ -307,8 +314,10 @@ def main():
         print("\nExamples:")
         print("  python run.py full --dataset cifar10  --imbalance 100")
         print("  python run.py full --dataset cifar100 --imbalance 100")
-        print("  python run.py custom --dataset cifar100 --epochs 30 --gpu 1")
+        print("  python run.py custom --dataset cifar100 --prompts 10 --images 2")
         print("  python run.py benchmark --datasets cifar10 cifar100")
+        print("\n'custom' keeps every benchmark default it is not given, so it stays")
+        print("comparable to 'full' unless you deliberately override something.")
         print("\nThe dataset sets the class count; both run at the benchmark protocol:")
         print("  cifar10  -> 10 classes,  32x32, ResNet32 (0.46M params)")
         print("  cifar100 -> 100 classes, 32x32, ResNet32 (0.46M params)")

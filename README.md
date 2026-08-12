@@ -181,6 +181,22 @@ python run.py custom --imbalance 20 --epochs 40 --synthetic-epochs 10 --rounds 2
 python run.py benchmark --datasets cifar10 cifar100
 ```
 
+### Multi-Seed Comparison Table
+
+Runs one benchmark over several seeds and reports mean accuracy, standard deviation and a 95%
+confidence interval, which is the format published long-tail results are quoted in.
+
+```bash
+python run_table.py --check                                  # which datasets are runnable
+python run_table.py --dataset cifar10  --imbalance 100       # 5 seeds
+python run_table.py --dataset cifar100 --imbalance 100 --prompts 10 --images 2
+python run_table.py --dataset cifar10  --seeds 3 --no-stable-diffusion   # fast iteration
+```
+
+Each seed runs as its own process and writes to `table_results/<dataset>_ir<N>_<stamp>/`,
+alongside a `table.json` and a `table.md` ready to paste into a report. A seed that crashes
+does not abort the sweep; the statistics then cover only the seeds that finished, and say so.
+
 ### Other Commands
 
 ```bash

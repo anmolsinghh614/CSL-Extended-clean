@@ -101,9 +101,9 @@ DATASET_CONFIGS = {
         'norm_mean': [0.466, 0.471, 0.380],
         'norm_std': [0.195, 0.194, 0.192],
         'backbone': 'ResNet50',
-        'epochs': 200,
+        'epochs': 160,                # LDAL reports 160 epochs on iNaturalist-2018
         'lr': 0.05,
-        'lr_decay_epochs': [160, 180],
+        'lr_decay_epochs': [120, 145],
         'lr_decay_factor': 0.1,
         'weight_decay': 1e-4,
         'momentum': 0.9,

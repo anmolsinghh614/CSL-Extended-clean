@@ -12,6 +12,11 @@ import copy
 def get_default_config():
     """Default configuration for the full pipeline."""
     return {
+        # Seeds weight initialization, batch shuffling and every sampler in the run. Vary this
+        # to produce the repeated runs a mean and standard deviation are computed over; it is
+        # separate from dataset.subset_seed, which fixes the benchmark subset itself.
+        'seed': 0,
+
         # Dataset configuration
         'dataset': {
             # 'cifar10' or 'cifar100'; both go through dataloaders/cifar_lt_loader.py so the

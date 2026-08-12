@@ -38,6 +38,7 @@ prompts/
 synthetic_features/
 synthetic_images/
 benchmark_results/
+table_results/
 
 # ── Run outputs (test / smoke configurations) ─────────────────────────────────
 test_checkpoints/

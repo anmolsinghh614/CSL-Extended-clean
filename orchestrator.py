@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset, ConcatDataset
 from torchvision import datasets, transforms
 import numpy as np
 import os
+import random
 import sys
 import json
 import argparse
@@ -66,6 +67,12 @@ class MemoryConditionedOrchestrator:
         """Initialize the orchestrator with configuration."""
         self.config = self._merge_config(config)
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Seed before anything random happens: weight initialization, batch shuffling, DDPM
+        # noise and Stable Diffusion latents all draw from the global generators. Reporting a
+        # mean and a standard deviation over several runs only means anything if each run is
+        # individually reproducible.
+        self._seed_everything(self.config['seed'])
         
         # Resolve the input resolution up front so every consumer (backbone stem, generated
         # image preprocessing, exemplar conversion) reads a concrete number rather than the
@@ -120,6 +127,23 @@ class MemoryConditionedOrchestrator:
             else:
                 print(f"  {key}: {value}")
         print("="*80 + "\n")
+    
+    @staticmethod
+    def _seed_everything(seed):
+        """
+        Seed every generator the run draws from.
+
+        `dataset.subset_seed` is deliberately *not* tied to this. Which images make up the
+        long-tailed subset is a property of the benchmark, so it stays fixed across seeds and
+        only the training randomness varies — otherwise a spread across seeds would mix
+        run-to-run variance with dataset-to-dataset variance and mean neither.
+        """
+        seed = int(seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     
     def _merge_config(self, config):
         """Overlay a user configuration on top of the shared defaults."""
@@ -1601,6 +1625,8 @@ def main():
                        help='Disable DDPM-based feature generation')
     parser.add_argument('--no-stable-diffusion', dest='use_sd', action='store_false', default=None,
                        help='Skip Stable Diffusion image synthesis (feature-space DDPM only)')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed for weight init and shuffling (default: config value)')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU device ID to use')
     
@@ -1628,6 +1654,12 @@ def main():
             'model': {'num_classes': num_classes}
         }, base=merge_config(config))
         print(f"Config override: dataset.name = {args.dataset} ({num_classes} classes)")
+    
+    # The seed has to be in place before construction, since the orchestrator seeds the global
+    # generators there — applying it through the override loop below would be too late.
+    if args.seed is not None:
+        config = merge_config({'seed': args.seed}, base=merge_config(config))
+        print(f"Config override: seed = {args.seed}")
     
     # Initialize orchestrator
     orchestrator = MemoryConditionedOrchestrator(config)
