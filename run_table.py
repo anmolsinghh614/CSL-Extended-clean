@@ -244,6 +244,12 @@ def run_seed(dataset, imbalance, seed, args, sweep_dir):
     print(f"  log: {log_path}")
     print(f"{'─' * 78}", flush=True)
 
+    # Writing to a file makes the child's stdout block-buffered, which holds several kilobytes
+    # of progress back before any of it reaches disk. Over a run this long that turns
+    # `tail -f` on the log into a useless way to tell whether anything is still happening.
+    env = os.environ.copy()
+    env['PYTHONUNBUFFERED'] = '1'
+
     started = time.time()
     with open(log_path, 'w', encoding='utf-8') as log:
         completed = subprocess.run(
@@ -252,7 +258,7 @@ def run_seed(dataset, imbalance, seed, args, sweep_dir):
              '--rounds', rounds,
              '--seed', str(seed),
              '--gpu', str(args.gpu)],
-            cwd=str(REPO_ROOT), stdout=log, stderr=subprocess.STDOUT
+            cwd=str(REPO_ROOT), stdout=log, stderr=subprocess.STDOUT, env=env
         )
     elapsed = time.time() - started
 
