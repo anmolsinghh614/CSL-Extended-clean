@@ -97,6 +97,10 @@ def get_default_config():
             'sd_inference_steps': 30,
             'sd_image_size': 512,
             'sd_guidance_scale': 7.5,
+            # None picks from the card's capacity. True streams the diffusion weights from
+            # host memory, which halves VRAM use and costs several times the runtime; set it
+            # explicitly only if the automatic choice turns out wrong.
+            'sd_low_vram': None,
             # Diffusion renders that land far from the real class distribution are discarded
             # rather than trained on. Same scale as the DDPM confidence.
             'min_image_feature_confidence': 0.5

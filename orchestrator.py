@@ -612,7 +612,8 @@ class MemoryConditionedOrchestrator:
             self.image_generator = Option3ImageGenerator(
                 model_type="stable_diffusion",
                 device=str(self.device),
-                output_dir=self.config['paths']['images_dir']
+                output_dir=self.config['paths']['images_dir'],
+                low_vram=self.config['generation'].get('sd_low_vram')
             )
         
         round_idx = len(self.metrics['generation_rounds'])

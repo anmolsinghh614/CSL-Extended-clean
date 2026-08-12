@@ -25,9 +25,12 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Only torch-free modules at import time. `get_num_classes` is imported lazily inside
+# build_config, because reaching it pulls in dataloaders/__init__ and from there the whole
+# torch stack — several seconds of load for subcommands like --check that just read dicts and
+# look for files on disk.
 from dataset_configs import DATASET_CONFIGS
 from pipeline_config import merge_config
-from dataloaders.cifar_lt_loader import get_num_classes
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -186,19 +189,22 @@ def summarize(values):
 
 # ─── Running one seed ────────────────────────────────────────────────────────
 
-def build_config(dataset, imbalance, seed, prompts, images, rounds, no_sd, results_dir):
+def build_config(dataset, imbalance, seed, args, results_dir):
     """Config for one seed, with the benchmark protocol left untouched unless overridden."""
+    from dataloaders.cifar_lt_loader import get_num_classes
     num_classes = get_num_classes(dataset)
 
     generation = {}
-    if prompts is not None:
-        generation['num_prompts_per_tail_class'] = prompts
-    if images is not None:
-        generation['images_per_prompt'] = images
-    if rounds is not None:
-        generation['generation_rounds'] = rounds
-    if no_sd:
+    if args.prompts is not None:
+        generation['num_prompts_per_tail_class'] = args.prompts
+    if args.images is not None:
+        generation['images_per_prompt'] = args.images
+    if args.rounds is not None:
+        generation['generation_rounds'] = args.rounds
+    if args.no_stable_diffusion:
         generation['use_stable_diffusion'] = False
+    if args.sd_low_vram is not None:
+        generation['sd_low_vram'] = args.sd_low_vram
 
     return merge_config({
         'seed': seed,
@@ -224,8 +230,7 @@ def run_seed(dataset, imbalance, seed, args, sweep_dir):
     results_dir = sweep_dir / f"seed{seed}"
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    config = build_config(dataset, imbalance, seed, args.prompts, args.images,
-                          args.rounds, args.no_stable_diffusion, str(results_dir))
+    config = build_config(dataset, imbalance, seed, args, str(results_dir))
 
     config_path = sweep_dir / f"config_seed{seed}.json"
     with open(config_path, 'w') as handle:
@@ -425,6 +430,10 @@ def main():
                         help='Improvement rounds (default: benchmark value, 3)')
     parser.add_argument('--no-stable-diffusion', action='store_true',
                         help='Skip Stable Diffusion; feature-space DDPM only (much faster)')
+    parser.add_argument('--sd-low-vram', dest='sd_low_vram', action='store_true', default=None,
+                        help='Force weight streaming for Stable Diffusion (slow, low VRAM)')
+    parser.add_argument('--no-sd-low-vram', dest='sd_low_vram', action='store_false',
+                        help='Force the diffusion pipeline to stay resident on the GPU (fast)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
     parser.add_argument('--out', type=str, default='./table_results',
                         help='Where to write logs, reports and the table')

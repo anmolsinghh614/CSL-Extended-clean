@@ -35,7 +35,8 @@ class Option3ImageGenerator:
                  model_type: str = "stable_diffusion",
                  model_id: str = "runwayml/stable-diffusion-v1-5",
                  device: str = "cuda",
-                 output_dir: str = "./generated_images"):
+                 output_dir: str = "./generated_images",
+                 low_vram: Optional[bool] = None):
         """
         Initialize image generator.
         
@@ -44,10 +45,14 @@ class Option3ImageGenerator:
             model_id: Model identifier for Hugging Face or local path
             device: Device for inference
             output_dir: Directory to save generated images
+            low_vram: Stream weights from host memory instead of keeping the pipeline
+                resident. Cuts VRAM roughly in half at a large cost in speed. None
+                decides from the card's capacity.
         """
         self.model_type = model_type
         self.model_id = model_id
         self.device = device
+        self.low_vram = low_vram
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
         
@@ -100,14 +105,23 @@ class Option3ImageGenerator:
         )
         
         if self.device == "cuda":
-            # Use sequential CPU offload — only loads one component to GPU at a time
-            # This uses ~2GB VRAM instead of ~4GB for the full model
-            try:
-                self.pipeline.enable_sequential_cpu_offload()
-                print("✓ Sequential CPU offload enabled (low VRAM mode)")
-            except Exception:
-                # Fallback to standard GPU loading
+            # Sequential CPU offload moves each submodule to the GPU as it is needed and back
+            # again afterwards, on every denoising step. It fits SD v1.5 into ~2GB instead of
+            # ~4GB, but the constant transfers dominate the runtime — several times slower
+            # than keeping the pipeline resident. Only worth paying on a card that cannot hold
+            # the model, so the default is decided by capacity rather than fixed.
+            if self.low_vram is None:
+                self.low_vram = self._detect_low_vram()
+
+            if self.low_vram:
+                try:
+                    self.pipeline.enable_sequential_cpu_offload()
+                    print("✓ Sequential CPU offload enabled (low VRAM mode, slower)")
+                except Exception:
+                    self.pipeline = self.pipeline.to(self.device)
+            else:
                 self.pipeline = self.pipeline.to(self.device)
+                print("✓ Pipeline resident on GPU (fast mode)")
             self.pipeline.enable_attention_slicing()
             # Enable xformers for faster inference if available
             try:
@@ -117,6 +131,24 @@ class Option3ImageGenerator:
                 pass
         
         print("✓ Stable Diffusion loaded successfully")
+    
+    def _detect_low_vram(self, threshold_gb: float = 10.0):
+        """
+        Decide whether the pipeline has to be streamed rather than kept resident.
+
+        SD v1.5 in fp16 needs roughly 4GB, but it shares the card with the classifier being
+        trained, its activations and the feature DDPM. The threshold leaves room for those;
+        below it, offloading is the difference between slow and out of memory.
+        """
+        try:
+            total_gb = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        except Exception:
+            return True
+
+        low = total_gb < threshold_gb
+        print(f"  Detected {total_gb:.1f}GB of VRAM — "
+              f"{'streaming weights' if low else 'keeping pipeline resident'}")
+        return low
         
     def generate_batch(self, 
                   prompts: List[str],
