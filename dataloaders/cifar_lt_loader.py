@@ -1,9 +1,10 @@
 """
 Long-tailed CIFAR-10 / CIFAR-100 loaders.
 
-Single entry point for the imbalanced CIFAR benchmarks so that this pipeline and the CSL
-baseline it extends see exactly the same data. The class-count profile and the per-dataset
-transforms are taken from the CSL dataloaders in `dataloaders/Legacy dataloaders/`.
+Single entry point for the imbalanced CIFAR benchmarks so that this pipeline and the
+baselines it is compared against see exactly the same data. The exponential class-count
+profile and the 32x32 transforms follow the standard long-tailed CIFAR protocol used by the
+published CIFAR-10-LT and CIFAR-100-LT results.
 
 Alongside the usual train and test loaders this returns a deterministic view of the *training*
 subset: the memory bank, exemplar selection and feature extraction all need the training
@@ -16,13 +17,17 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
 
-# Resolution and normalization are taken per-dataset from the legacy CSL dataloaders rather
-# than made uniform: CIFAR-10 was trained at the native 32x32 with CIFAR-10 channel
-# statistics, CIFAR-100 at ImageNet resolution with a plain (0.5, 0.5) rescale. Reported
-# accuracies are only comparable to the CSL baseline if the inputs match, so these are
-# deliberately not "corrected" to the textbook per-dataset statistics.
+# Both benchmarks are trained at the native 32x32 with per-dataset channel statistics, which
+# is the protocol the published CIFAR-10-LT and CIFAR-100-LT accuracies are measured under
+# (LDAM-DRW -> AREA -> LDAL all share it).
+#
+# An earlier revision upsampled CIFAR-100 to 224x224 with a plain (0.5, 0.5) rescale, copied
+# from `Legacy dataloaders/cifar_100_loader.py`. That file only ever defined transforms, and
+# the resolution it implies costs a great deal of compute while adding no information: a
+# 32x32 image resized to 224x224 carries the same content, and training a large backbone on
+# it from scratch on ~10.8k images lands well below the published cross-entropy baseline.
 CIFAR10_STATS = ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-CIFAR100_STATS = ((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+CIFAR100_STATS = ((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2762))
 
 DATASET_SPECS = {
     'cifar10': {
@@ -35,7 +40,7 @@ DATASET_SPECS = {
         'cls': datasets.CIFAR100,
         'num_classes': 100,
         'stats': CIFAR100_STATS,
-        'image_size': 224,
+        'image_size': 32,
     },
 }
 
@@ -69,8 +74,8 @@ def build_transforms(dataset, image_size=None):
     Training and evaluation transforms for one CIFAR variant.
 
     At the native 32x32 the standard long-tail recipe applies (pad-and-crop plus horizontal
-    flip). At ImageNet resolution the crop has to resize as well, and brightness jitter is
-    added, which is what the CSL CIFAR-100 setup does.
+    flip) and evaluation is undistorted. The resize branch exists only for deliberate
+    deviations from the benchmark, where `image_size` is passed explicitly.
     """
     name = _normalize_name(dataset)
     if image_size is None:

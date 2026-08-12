@@ -143,7 +143,10 @@ def main():
 
     def instrumented_step6(features, epochs):
         classifier = orchestrator._get_classifier()
-        stem = orchestrator.model.model.conv1
+        # The CIFAR ResNet-32 holds its stem directly; the wrapped torchvision backbones nest
+        # it under `.model`.
+        backbone = orchestrator.model
+        stem = backbone.conv1 if hasattr(backbone, 'conv1') else backbone.model.conv1
         weights['fc_before'] = classifier.weight.detach().clone()
         weights['stem_before'] = stem.weight.detach().clone()
         result = original_step6(features, epochs)

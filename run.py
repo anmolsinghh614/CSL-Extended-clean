@@ -67,10 +67,10 @@ def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
     """
     Build a config for one benchmark.
 
-    The class count follows from the dataset, and the backbone follows from the resolution it
-    is trained at: CIFAR-10 at 32x32 needs the small-image ResNet, CIFAR-100 at the CSL
-    setup's 224x224 needs ResNet50. Deriving both here means a run cannot be started with a
-    model that disagrees with its data.
+    The class count follows from the dataset. Both CIFAR benchmarks default to the CIFAR
+    ResNet-32 at 32x32, which is the protocol their published accuracies are measured under;
+    `arch` overrides it only for deliberate deviations. Deriving this here means a run cannot
+    be started with a model that disagrees with its data.
     """
     num_classes = get_num_classes(dataset)
     dataset_section = {'name': dataset, 'num_classes': num_classes}
@@ -81,7 +81,7 @@ def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
         'dataset': dataset_section,
         'model': {
             'num_classes': num_classes,
-            'architecture': arch or ('ResNet32' if dataset == 'cifar10' else 'ResNet50'),
+            'architecture': arch or 'ResNet32',
         },
     })
 
@@ -105,8 +105,8 @@ def run_full_training():
     parser = argparse.ArgumentParser(description='Full training run')
     parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
                        help='Long-tailed benchmark to run on (default: cifar10)')
-    parser.add_argument('--arch', choices=['ResNet32', 'ResNet50'], default=None,
-                       help='Backbone; defaults to the one matching the dataset resolution')
+    parser.add_argument('--arch', choices=['ResNet32', 'ResNet34', 'ResNet50'], default=None,
+                       help='Backbone; defaults to the benchmark ResNet32')
     parser.add_argument('--imbalance', type=int, default=None,
                        help='Imbalance ratio (default: the config value, 100)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
@@ -138,9 +138,9 @@ def run_custom():
     
     parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
                        help='Long-tailed benchmark to run on (default: cifar10)')
-    parser.add_argument('--arch', choices=['ResNet32', 'ResNet50'], default=None,
-                       help='Backbone; defaults to ResNet32 for cifar10 and ResNet50 for '
-                            'cifar100, matching the resolution each is trained at')
+    parser.add_argument('--arch', choices=['ResNet32', 'ResNet34', 'ResNet50'], default=None,
+                       help='Backbone; defaults to the benchmark ResNet32 for both CIFAR '
+                            'variants')
     parser.add_argument('--imbalance', type=int, default=100,
                        help='Imbalance ratio (default: 100)')
     parser.add_argument('--epochs', type=int, default=20,
@@ -309,9 +309,9 @@ def main():
         print("  python run.py full --dataset cifar100 --imbalance 100")
         print("  python run.py custom --dataset cifar100 --epochs 30 --gpu 1")
         print("  python run.py benchmark --datasets cifar10 cifar100")
-        print("\nThe dataset sets the class count, input resolution and backbone:")
-        print("  cifar10  -> 10 classes,  32x32,  ResNet32")
-        print("  cifar100 -> 100 classes, 224x224, ResNet50")
+        print("\nThe dataset sets the class count; both run at the benchmark protocol:")
+        print("  cifar10  -> 10 classes,  32x32, ResNet32 (0.46M params)")
+        print("  cifar100 -> 100 classes, 32x32, ResNet32 (0.46M params)")
         sys.exit(1)
     
     command = sys.argv[1].lower()

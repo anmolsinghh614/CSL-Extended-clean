@@ -44,7 +44,8 @@ class FeatureDDPM(nn.Module):
                  beta_schedule='cosine'):
         """
         Args:
-            feature_dim: Dimension of ResNet features (512 for ResNet32)
+            feature_dim: Dimension of the backbone's penultimate features (64 for the CIFAR
+                ResNet-32, 512 for ResNet-34, 2048 for ResNet-50)
             num_classes: Number of classes (10 for CIFAR-10)
             hidden_dim: Hidden layer dimension
             num_layers: Number of MLP layers

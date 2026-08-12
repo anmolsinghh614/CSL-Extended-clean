@@ -1,9 +1,12 @@
 """
 Dataset Configuration Registry
 ================================
-Per-dataset metadata matching the CSL paper (Section IV: Implementation).
-Each config contains training hyperparameters, normalization stats,
-and architecture choices exactly as described in the paper.
+Per-dataset training hyperparameters, normalization statistics and architecture choices.
+
+The CIFAR entries follow the standard long-tailed CIFAR protocol that the published
+CIFAR-10-LT and CIFAR-100-LT accuracies are measured under: the CIFAR ResNet-32 at native
+32x32, 200 epochs of SGD from learning rate 0.1 decayed by 0.01 at epochs 160 and 180, with
+weight decay 2e-4.
 """
 
 DATASET_CONFIGS = {
@@ -13,12 +16,12 @@ DATASET_CONFIGS = {
         'image_size': 32,
         'norm_mean': [0.4914, 0.4822, 0.4465],
         'norm_std': [0.2023, 0.1994, 0.2010],
-        'backbone': 'ResNet32',       # ResNet-32 (wraps resnet34)
+        'backbone': 'ResNet32',
         'epochs': 200,
         'lr': 0.1,
         'lr_decay_epochs': [160, 180],
         'lr_decay_factor': 0.01,
-        'weight_decay': 5e-4,
+        'weight_decay': 2e-4,
         'momentum': 0.9,
         'batch_size': 128,
         'imbalance_ratios': [50, 100],
@@ -32,18 +35,17 @@ DATASET_CONFIGS = {
     'cifar100': {
         'name': 'CIFAR-100-LT',
         'num_classes': 100,
-        # The CSL CIFAR-100 setup upsamples to ImageNet resolution and rescales by (0.5, 0.5)
-        # rather than using per-channel CIFAR-100 statistics. Kept as-is so accuracies stay
-        # comparable to the published baseline; see dataloaders/cifar_lt_loader.py.
-        'image_size': 224,
-        'norm_mean': [0.5, 0.5, 0.5],
-        'norm_std': [0.5, 0.5, 0.5],
-        'backbone': 'ResNet50',
+        # Native resolution with per-channel CIFAR-100 statistics and the CIFAR ResNet-32,
+        # which is the protocol the published CIFAR-100-LT accuracies are measured under.
+        'image_size': 32,
+        'norm_mean': [0.5071, 0.4865, 0.4409],
+        'norm_std': [0.2673, 0.2564, 0.2762],
+        'backbone': 'ResNet32',
         'epochs': 200,
         'lr': 0.1,
         'lr_decay_epochs': [160, 180],
         'lr_decay_factor': 0.01,
-        'weight_decay': 5e-4,
+        'weight_decay': 2e-4,
         'momentum': 0.9,
         'batch_size': 128,
         'imbalance_ratios': [50, 100, 200],

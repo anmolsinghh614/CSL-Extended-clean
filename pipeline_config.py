@@ -22,16 +22,17 @@ def get_default_config():
             'batch_size': 128,
             'num_workers': 4,
             'data_dir': './data',
-            # None takes the resolution the CSL baseline used for the chosen dataset: 32 for
-            # CIFAR-10, 224 for CIFAR-100. Set it explicitly only to deviate from that.
+            # None takes the benchmark resolution for the chosen dataset, which is the native
+            # 32 for both CIFAR variants. Set it explicitly only to deviate from that.
             'image_size': None,
             'subset_seed': 42            # Fixes which images each class keeps
         },
 
         # Model configuration
         'model': {
+            # The CIFAR ResNet-32 the long-tailed CIFAR benchmarks report against.
             'architecture': 'ResNet32',
-            'feature_dim': 512,  # ResNet32 (actually ResNet34) uses 512-dim features
+            'feature_dim': 64,   # Overwritten at build time from the actual backbone
             'num_classes': 10
         },
 
@@ -44,14 +45,16 @@ def get_default_config():
         },
 
         # Training configuration
+        # Optimizer settings follow the standard long-tailed CIFAR protocol (LDAM-DRW ->
+        # AREA -> LDAL), so a number produced here is comparable to the published ones.
         'training': {
-            'initial_epochs': 200,        # ResNet-34 needs ~200 epochs on CIFAR-10
+            'initial_epochs': 200,
             'synthetic_epochs': 25,       # Enough to integrate synthetic features
             'lr': 0.1,
             'momentum': 0.9,
-            'weight_decay': 5e-4,
-            'scheduler_milestones': [160, 180],  # Decay at 80% and 90% of total
-            'scheduler_gamma': 0.1,
+            'weight_decay': 2e-4,
+            'scheduler_milestones': [160, 180],
+            'scheduler_gamma': 0.01,
             'synthetic_lr_scale': 0.1,    # Fine-tuning LR relative to the base LR
             # Synthetic features are vectors in the feature space of the frozen backbone.
             # If the backbone keeps training they stop describing anything the classifier
@@ -99,7 +102,7 @@ def get_default_config():
             'enabled': True,
             'num_timesteps': 1000,
             'beta_schedule': 'cosine',
-            'hidden_dim': 1024,           # 2x feature_dim for representational capacity
+            'hidden_dim': 1024,           # Denoiser width; independent of feature_dim
             'num_layers': 4,
             'training_steps': 10000,      # More training = better feature quality
             'max_epochs': 50,

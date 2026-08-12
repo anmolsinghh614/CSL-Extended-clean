@@ -6,7 +6,7 @@ from utils.memory_bank import MemoryBank
 from utils.memory_manager import MemoryManager
 from utils.csl_loss import CSLLossFunc
 from phase3_feature_ddpm import FeatureDDPM
-from models import ResNet32
+from models import ResNet32, ResNet34
 from pipeline_config import get_default_config, get_test_config, merge_config
 
 
@@ -148,6 +148,18 @@ def check_ddpm_standardization():
 def check_config():
     default = get_default_config()
     assert default['generation']['tail_improvement_threshold'] == 2.0
+
+    # The long-tailed CIFAR protocol the published accuracies are measured under. A silent
+    # drift here makes every number in the report incomparable, so it is pinned.
+    training = default['training']
+    assert default['model']['architecture'] == 'ResNet32'
+    assert training['initial_epochs'] == 200
+    assert training['lr'] == 0.1
+    assert training['momentum'] == 0.9
+    assert training['weight_decay'] == 2e-4
+    assert training['scheduler_milestones'] == [160, 180]
+    assert training['scheduler_gamma'] == 0.01
+
     merged = merge_config({'training': {'initial_epochs': 7}})
     assert merged['training']['initial_epochs'] == 7
     assert merged['training']['synthetic_epochs'] == default['training']['synthetic_epochs']
@@ -157,15 +169,58 @@ def check_config():
     print("config OK")
 
 
+def check_backbone():
+    """
+    The CIFAR ResNet-32 is the backbone the published CIFAR-LT accuracies are measured with,
+    so its shape is a benchmark property rather than an implementation detail. 6n+2 = 32
+    weighted layers at 16/32/64 channels comes to 0.46M parameters; a torchvision ResNet with
+    a swapped stem would be ~21M and would not be the same experiment.
+    """
+    model = ResNet32(num_classes=10)
+    params = sum(p.numel() for p in model.parameters())
+    assert 0.45e6 < params < 0.48e6, f"ResNet32 has {params:,} parameters, expected ~0.46M"
+
+    convs = [m for m in model.modules() if isinstance(m, torch.nn.Conv2d)]
+    assert len(convs) == 31, f"expected 31 convolutions (1 stem + 15 blocks x 2), got {len(convs)}"
+    assert model.get_feature_dim() == 64
+
+    logits, features = model(torch.randn(2, 3, 32, 32), return_features=True)
+    assert logits.shape == (2, 10), logits.shape
+    assert features.shape == (2, 64), features.shape
+    # Features are read after the block's final ReLU, which the DDPM relies on when it fits
+    # standardization statistics with non_negative=True.
+    assert features.min() >= 0.0
+
+    # 100-class head, and a resolution other than 32 (adaptive pooling should absorb it).
+    wide = ResNet32(num_classes=100)
+    assert wide(torch.randn(2, 3, 64, 64)).shape == (2, 100)
+
+    try:
+        ResNet32(num_classes=10, pretrained=True)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("ResNet32 should reject pretrained=True; no such weights exist")
+
+    print(f"backbone OK ({params:,} parameters, {model.get_feature_dim()}-dim features)")
+
+
 def check_classifier_lookup():
     from orchestrator import MemoryConditionedOrchestrator
     orch = MemoryConditionedOrchestrator.__new__(MemoryConditionedOrchestrator)
     orch.model = ResNet32(num_classes=10)
     orch.config = get_default_config()
     classifier = orch._get_classifier()
-    assert classifier is orch.model.model.fc
-    assert orch._get_feature_dim() == 512
+    assert classifier is orch.model.fc
+    assert orch._get_feature_dim() == 64
     print("classifier lookup OK")
+
+    # The wrapped torchvision backbones nest their classifier one level deeper, so the lookup
+    # has to handle both shapes.
+    orch.model = ResNet34(num_classes=10)
+    assert orch._get_classifier() is orch.model.model.fc
+    assert orch._get_feature_dim() == 512
+    print("classifier lookup (wrapped backbone) OK")
 
 
 if __name__ == '__main__':
@@ -173,6 +228,7 @@ if __name__ == '__main__':
     check_memory_bank()
     check_memory_manager()
     check_csl_loss()
+    check_backbone()
     check_classifier_lookup()
     check_ddpm_standardization()
     print("\nAll component checks passed.")

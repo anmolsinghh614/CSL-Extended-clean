@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 from pipeline_config import get_default_config, merge_config
 from dataloaders import (get_cifar_lt_loaders, get_default_image_size, get_normalization,
                          get_num_classes)
-from models import ResNet32, ResNet50
+from models import ResNet32, ResNet34, ResNet50
 from utils import CSLLossFunc
 from utils.memory_manager import MemoryManager
 from utils.visual_exemplar_prompt_generator import VisualExemplarPromptGenerator
@@ -94,6 +94,11 @@ class MemoryConditionedOrchestrator:
         
         # Snapshot of performance after initial training, before any synthetic data
         self.baseline_snapshot = None
+        
+        # Generated images are written under this, so two runs — and two datasets, whose tail
+        # class indices can coincide — never write to the same filenames.
+        self.run_id = (f"{self.config['dataset']['name']}_"
+                       f"{datetime.now().strftime('%Y%m%d_%H%M%S')}")
         
         # Replaced with the dataset's real label names in step 1; placeholders until then so
         # that anything logging a class can do so before the data is loaded.
@@ -206,18 +211,28 @@ class MemoryConditionedOrchestrator:
         print("STEP 2: TRAINING MEMORY BANK ON IMBALANCED DATA")
         print("="*80)
         
-        # The stem depends on the input resolution: at 32x32 the ImageNet 7x7-stride-2 conv
-        # plus maxpool would shrink the image to 8x8 before the residual blocks, so a 3x3
-        # stem is substituted. At 224 the ImageNet stem is correct and must be left alone.
+        # The ImageNet backbones need their stem swapped for small inputs: at 32x32 the
+        # 7x7-stride-2 conv plus maxpool would shrink the image to 8x8 before the residual
+        # blocks. They take image_size and adapt themselves. ResNet32 is natively a CIFAR
+        # network and has no such stem.
         image_size = self.config['dataset']['image_size']
         num_classes = self.config['model']['num_classes']
         
-        architecture = ResNet32 if self.config['model']['architecture'] == 'ResNet32' else ResNet50
-        self.model = architecture(num_classes=num_classes, image_size=image_size).to(self.device)
+        architectures = {'ResNet32': ResNet32, 'ResNet34': ResNet34, 'ResNet50': ResNet50}
+        name = self.config['model']['architecture']
+        if name not in architectures:
+            raise ValueError(
+                f"Unknown architecture {name!r}; expected one of {sorted(architectures)}")
+        
+        self.model = architectures[name](
+            num_classes=num_classes, image_size=image_size).to(self.device)
+        
+        param_count = sum(p.numel() for p in self.model.parameters())
+        print(f"  Backbone: {name} ({param_count:,} parameters, {image_size}x{image_size} input)")
         
         # Take the feature width from the backbone rather than the config: ResNet50 produces
-        # 2048 where ResNet34 produces 512, and the DDPM and saved report must agree with
-        # whichever is actually in use.
+        # 2048 and ResNet34 512 where the CIFAR ResNet-32 produces 64, and the DDPM and saved
+        # report must agree with whichever is actually in use.
         self.config['model']['feature_dim'] = self._get_feature_dim()
         
         # Initialize memory manager with memory bank
@@ -593,7 +608,7 @@ class MemoryConditionedOrchestrator:
                     num_inference_steps=self.config['generation']['sd_inference_steps'],
                     image_size=self.config['generation']['sd_image_size'],
                     guidance_scale=self.config['generation']['sd_guidance_scale'],
-                    subdir=f"round{round_idx}"
+                    subdir=f"{self.run_id}/round{round_idx}"
                 )
                 class_images.extend(images)
                 

@@ -32,7 +32,7 @@ The key innovation is using **both image-space generation** (Stable Diffusion) a
 |---------|-------------|
 | **Class-Sensitive Loss (CSL)** | Focal-style auxiliary loss that adaptively boosts gradient flow for tail classes |
 | **Memory Bank** | EMA prototypes + Reservoir sampling to track evolving class representations |
-| **Feature-Space DDPM** | Generates 512-dim ResNet feature vectors directly — no image generation needed |
+| **Feature-Space DDPM** | Generates ResNet penultimate-layer feature vectors directly — no image generation needed |
 | **Visual Exemplar Prompting** | BLIP captioning + CLIP similarity to create accurate Stable Diffusion prompts |
 | **Homogeneous Batch Sampling** | Custom sampler ensuring batches contain either images (4D) or features (2D), never mixed |
 | **Iterative Self-Improvement** | Closed-loop pipeline: train → evaluate → generate → retrain until convergence |
@@ -76,7 +76,7 @@ The key innovation is using **both image-space generation** (Stable Diffusion) a
 │  │                     │                                  │         │
 │  │  Step 5: Extract Features + Train DDPM                │         │
 │  │  ┌──────────────────────────────────────────┐         │         │
-│  │  │ SD images → ResNet → 512-dim features             │         │
+│  │  │ SD images → ResNet → backbone features            │         │
 │  │  │ Real features → Train DDPM → Generate more        │         │
 │  │  │ Combine: SD features + DDPM features              │         │
 │  │  └──────────────────────────────────────────┘         │         │
@@ -164,7 +164,7 @@ python run.py full
 | Imbalance Ratio | 10 | Moderate long-tail distribution |
 | Initial Epochs | 50 | Memory bank training |
 | Synthetic Epochs | 15 | Fine-tuning with augmented data |
-| DDPM Hidden Dim | 512 | Matches ResNet feature dimension |
+| DDPM Hidden Dim | 1024 | Width of the denoiser MLP |
 | DDPM Training Steps | 10,000 | Feature generation quality |
 | Features per Class | 300 | Synthetic features per tail class |
 | Improvement Rounds | 3 | Iterative generate-retrain cycles |
@@ -262,7 +262,7 @@ Each class maintains:
 
 ### Feature-Space DDPM
 
-Instead of generating images, the DDPM generates **512-dimensional feature vectors** directly in ResNet's embedding space:
+Instead of generating images, the DDPM generates **penultimate-layer feature vectors** directly in ResNet's embedding space (64-dim for the CIFAR ResNet-32):
 - Uses cosine noise schedule (better than linear for features)
 - Class-conditioned generation via learned class embeddings
 - Supports fast DDIM sampling for inference
@@ -299,19 +299,27 @@ Tail Class Improvements:
 
 ## Supported Datasets
 
-| Dataset | Classes | Image Size | Loader |
-|---------|---------|-----------|--------|
-| CIFAR-10-LT | 10 | 32×32 | `dataloaders/cifar_lt_loader.py` |
-| CIFAR-100-LT | 100 | 32×32 | `dataloaders/cifar_lt_loader.py` |
-| Tiny ImageNet | 200 | 64×64 | `dataloaders/tiny_imagenet_loader.py` |
-| ImageNet-LT | 1000 | 224×224 | `dataloaders/imagenet_lt_loader.py` |
-| iNaturalist 2018 | 8142 | 224×224 | `dataloaders/inaturalist_loader.py` |
+| Dataset | Classes | Image Size | Backbone | Loader |
+|---------|---------|-----------|----------|--------|
+| CIFAR-10-LT | 10 | 32×32 | ResNet-32 | `dataloaders/cifar_lt_loader.py` |
+| CIFAR-100-LT | 100 | 32×32 | ResNet-32 | `dataloaders/cifar_lt_loader.py` |
+| Tiny ImageNet | 200 | 64×64 | ResNet-18 | `dataloaders/tiny_imagenet_loader.py` |
+| ImageNet-LT | 1000 | 224×224 | ResNet-50 | `dataloaders/imagenet_lt_loader.py` |
+| iNaturalist 2018 | 8142 | 224×224 | ResNet-50 | `dataloaders/inaturalist_loader.py` |
 
 Both CIFAR benchmarks go through the same loader, which reproduces the long-tail profile the
-CSL results are reported against: `n_k = n_max · ratio^(−k/(C−1))`, so class 0 keeps all its
-images and the last class keeps `1/ratio` of them. At the standard `--imbalance 100` that is
-5000→50 images per class for CIFAR-10-LT (12,406 total) and 500→5 for CIFAR-100-LT (10,847
+published results are reported against: `n_k = n_max · ratio^(−k/(C−1))`, so class 0 keeps all
+its images and the last class keeps `1/ratio` of them. At the standard `--imbalance 100` that
+is 5000→50 images per class for CIFAR-10-LT (12,406 total) and 500→5 for CIFAR-100-LT (10,847
 total). `subset_seed` fixes which images each class keeps so a run can be repeated exactly.
+
+`ResNet-32` here means the CIFAR ResNet of He et al. — three stages of five basic blocks at
+16/32/64 channels, ~0.46M parameters, 64-dim features — which is the backbone the
+CIFAR-10-LT and CIFAR-100-LT literature reports against. It is a different network from a
+torchvision ResNet with a CIFAR stem; that one is available as `--arch ResNet34` (~21M
+parameters, 512-dim features) but its accuracies are not comparable to published numbers.
+The CIFAR runs also match the standard optimizer protocol: 200 epochs of SGD from learning
+rate 0.1, decayed by 0.01 at epochs 160 and 180, momentum 0.9, weight decay 2e-4.
 
 ```bash
 python run.py custom --dataset cifar100 --imbalance 100
@@ -328,7 +336,7 @@ label count that disagrees with the data.
 |-------|----------|
 | **CUDA Out of Memory** | Reduce `batch_size` in config, or use `run.py test` for lighter settings |
 | **Stable Diffusion download fails** | Ensure internet connection; model is ~5GB on first run |
-| **Feature dimension mismatch** | Verify `feature_dim` matches your model's output (512 for ResNet32/34) |
+| **Feature dimension mismatch** | `feature_dim` is taken from the backbone at build time (64 for ResNet32, 512 for ResNet34, 2048 for ResNet50) |
 | **Process killed silently** | OOM killer; monitor RAM usage, reduce `num_workers` |
 | **Low improvement on tail classes** | Enable DDPM (`--ddpm`), increase `features_per_class`, or try lower `imbalance_ratio` |
 
