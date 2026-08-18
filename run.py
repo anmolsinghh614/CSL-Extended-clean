@@ -13,7 +13,10 @@ from datetime import datetime
 from pathlib import Path
 
 from pipeline_config import get_default_config, get_test_config, merge_config
-from dataloaders.cifar_lt_loader import get_num_classes
+from dataloaders import get_num_classes, uses_imbalance_ratio
+from dataset_configs import get_dataset_config
+
+DATASET_CHOICES = ['cifar10', 'cifar100', 'imagenet_lt', 'inaturalist']
 
 # Windows defaults stdout to cp1252 when it is redirected to a file, which cannot encode the
 # status glyphs used below; without this, piping a run to a log file crashes on the first print.
@@ -65,23 +68,50 @@ def _write_config(config, config_path):
 
 def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
     """
-    Build a config for one benchmark.
+    Build a config for one benchmark, with that benchmark's published training protocol.
 
-    The class count follows from the dataset. Both CIFAR benchmarks default to the CIFAR
-    ResNet-32 at 32x32, which is the protocol their published accuracies are measured under;
-    `arch` overrides it only for deliberate deviations. Deriving this here means a run cannot
-    be started with a model that disagrees with its data.
+    The class count, backbone, resolution, batch size and optimizer schedule all follow from
+    the dataset, and are read from dataset_configs.py so there is one place where "how is this
+    benchmark trained" is recorded. The CIFAR pair uses ResNet-32 at 32x32 for 200 epochs;
+    ImageNet-LT and iNaturalist use ResNet-50 at 224 for 120 and 160. `arch` overrides the
+    backbone only for deliberate deviations.
+
+    Deriving all of it here means a run cannot be started with a model or a schedule that
+    disagrees with its data.
     """
     num_classes = get_num_classes(dataset)
-    dataset_section = {'name': dataset, 'num_classes': num_classes}
-    if imbalance is not None:
-        dataset_section['imbalance_ratio'] = imbalance
+    protocol = get_dataset_config(dataset)
+
+    dataset_section = {
+        'name': dataset,
+        'num_classes': num_classes,
+        'batch_size': protocol['batch_size'],
+    }
+    # An imbalance ratio only means something where this code builds the imbalance. ImageNet-LT
+    # and iNaturalist-2018 come long-tailed from their published splits, and the loader rejects
+    # a ratio rather than pretending to honour it.
+    if uses_imbalance_ratio(dataset):
+        if imbalance is not None:
+            dataset_section['imbalance_ratio'] = imbalance
+    else:
+        dataset_section['imbalance_ratio'] = None
+        if imbalance is not None:
+            print(f"Note: {protocol['name']} has a fixed long-tailed split, so "
+                  f"--imbalance {imbalance} does not apply and is ignored.")
 
     config = merge_config({
         'dataset': dataset_section,
         'model': {
             'num_classes': num_classes,
-            'architecture': arch or 'ResNet32',
+            'architecture': arch or protocol['backbone'],
+        },
+        'training': {
+            'initial_epochs': protocol['epochs'],
+            'lr': protocol['lr'],
+            'momentum': protocol['momentum'],
+            'weight_decay': protocol['weight_decay'],
+            'scheduler_milestones': protocol['lr_decay_epochs'],
+            'scheduler_gamma': protocol['lr_decay_factor'],
         },
     })
 
@@ -103,12 +133,13 @@ def run_quick_test():
 def run_full_training():
     """Run full training with optimal settings on the chosen benchmark."""
     parser = argparse.ArgumentParser(description='Full training run')
-    parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
+    parser.add_argument('--dataset', choices=DATASET_CHOICES, default='cifar10',
                        help='Long-tailed benchmark to run on (default: cifar10)')
     parser.add_argument('--arch', choices=['ResNet32', 'ResNet34', 'ResNet50'], default=None,
-                       help='Backbone; defaults to the benchmark ResNet32')
+                       help="Backbone; defaults to the benchmark's own (ResNet32 for CIFAR, "
+                            "ResNet50 for ImageNet-LT and iNaturalist)")
     parser.add_argument('--imbalance', type=int, default=None,
-                       help='Imbalance ratio (default: the config value, 100)')
+                       help='Imbalance ratio for the CIFAR benchmarks (default: 100)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
     args = parser.parse_args(sys.argv[2:])  # Skip 'run.py full'
     
@@ -143,7 +174,7 @@ def run_custom():
     """
     parser = argparse.ArgumentParser(description='Custom run configuration')
     
-    parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default='cifar10',
+    parser.add_argument('--dataset', choices=DATASET_CHOICES, default='cifar10',
                        help='Long-tailed benchmark to run on (default: cifar10)')
     parser.add_argument('--arch', choices=['ResNet32', 'ResNet34', 'ResNet50'], default=None,
                        help='Backbone; defaults to the benchmark ResNet32 for both CIFAR '

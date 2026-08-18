@@ -37,8 +37,8 @@ import matplotlib.pyplot as plt
 
 # Import all your existing components
 from pipeline_config import get_default_config, merge_config
-from dataloaders import (get_cifar_lt_loaders, get_default_image_size, get_normalization,
-                         get_num_classes)
+from dataloaders import (get_lt_loaders, get_default_image_size, get_normalization,
+                         get_num_classes, uses_imbalance_ratio)
 from models import ResNet32, ResNet34, ResNet50
 from utils import CSLLossFunc
 from utils.memory_manager import MemoryManager
@@ -161,7 +161,7 @@ class MemoryConditionedOrchestrator:
         print("✓ Directories created")
     
     def step1_create_imbalanced_dataset(self):
-        """Step 1: Build the long-tailed training set via the shared CIFAR-LT loader."""
+        """Step 1: Build the long-tailed training set for the configured benchmark."""
         dataset_config = self.config['dataset']
         dataset_name = dataset_config['name']
         
@@ -169,17 +169,25 @@ class MemoryConditionedOrchestrator:
         print(f"STEP 1: CREATING IMBALANCED {dataset_name.upper()} DATASET")
         print("="*80)
         
-        # Routed through dataloaders/cifar_lt_loader.py so this pipeline and the CSL baseline
-        # it is compared against are trained on the same images with the same preprocessing.
-        bundle = get_cifar_lt_loaders(
-            dataset=dataset_name,
-            batch_size=dataset_config['batch_size'],
-            imbalance_ratio=dataset_config['imbalance_ratio'],
-            num_workers=dataset_config['num_workers'],
-            data_dir=dataset_config['data_dir'],
-            image_size=dataset_config['image_size'],
-            seed=dataset_config['subset_seed']
-        )
+        # Routed through dataloaders/registry.py so this pipeline and the baselines it is
+        # compared against are trained on the same images with the same preprocessing. CIFAR
+        # is subsampled to a chosen imbalance ratio; ImageNet-LT and iNaturalist-2018 instead
+        # come long-tailed already, from their published split files.
+        loader_args = {
+            'dataset': dataset_name,
+            'batch_size': dataset_config['batch_size'],
+            'num_workers': dataset_config['num_workers'],
+            'image_size': dataset_config['image_size'],
+        }
+        if uses_imbalance_ratio(dataset_name):
+            loader_args['imbalance_ratio'] = dataset_config['imbalance_ratio']
+            loader_args['data_dir'] = dataset_config['data_dir']
+            loader_args['seed'] = dataset_config['subset_seed']
+        else:
+            loader_args['imbalance_ratio'] = None
+            loader_args['data_root'] = dataset_config.get('data_root')
+        
+        bundle = get_lt_loaders(**loader_args)
         
         self.train_loader = bundle['train_loader']
         self.train_eval_loader = bundle['train_eval_loader']
@@ -1612,8 +1620,9 @@ def main():
                        help='Path to configuration file (JSON)')
     parser.add_argument('--rounds', type=int, default=3,
                        help='Maximum number of improvement rounds')
-    parser.add_argument('--dataset', choices=['cifar10', 'cifar100'], default=None,
-                       help='Long-tailed benchmark to run on')
+    parser.add_argument('--dataset',
+                       choices=['cifar10', 'cifar100', 'imagenet_lt', 'inaturalist'],
+                       default=None, help='Long-tailed benchmark to run on')
     parser.add_argument('--imbalance-ratio', type=int, default=None,
                        help='Imbalance ratio (n_max / n_min) of the long-tailed training set')
     parser.add_argument('--initial-epochs', type=int, default=None,

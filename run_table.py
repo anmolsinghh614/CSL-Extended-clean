@@ -29,7 +29,7 @@ from pathlib import Path
 # build_config, because reaching it pulls in dataloaders/__init__ and from there the whole
 # torch stack — several seconds of load for subcommands like --check that just read dicts and
 # look for files on disk.
-from dataset_configs import DATASET_CONFIGS
+from dataset_configs import DATASET_CONFIGS, get_dataset_config
 from pipeline_config import merge_config
 
 for _stream in (sys.stdout, sys.stderr):
@@ -56,6 +56,11 @@ LDAL_BEST = {
 CIFAR_DATASETS = ('cifar10', 'cifar100')
 
 
+def imbalance_label(imbalance):
+    """How to name a run's imbalance setting, for directories and headings."""
+    return f"ir{imbalance}" if imbalance is not None else "natural-lt"
+
+
 def python_executable():
     """Prefer a project virtualenv over whatever interpreter launched this script."""
     candidates = [
@@ -76,14 +81,17 @@ PYTHON_EXE = python_executable()
 
 # ─── Dataset availability ────────────────────────────────────────────────────
 
+ENV_VARS = {'imagenet_lt': 'IMAGENET_LT_ROOT', 'inaturalist': 'INATURALIST_ROOT'}
+
+
 def describe_availability(dataset):
     """
     Report whether `dataset` can be run, and if not, exactly what is missing.
 
     CIFAR-10 and CIFAR-100 download themselves through torchvision. ImageNet-LT and
     iNaturalist-2018 cannot: they need image archives that are hundreds of gigabytes and, for
-    ImageNet, an account on image-net.org. Both also need the split files that define which
-    images belong to the long-tailed subset, and only the validation splits are in this repo.
+    ImageNet, an account on image-net.org. Their split files ship with this repo, so what is
+    usually missing is the extracted image tree.
     """
     cfg = DATASET_CONFIGS[dataset]
 
@@ -92,17 +100,25 @@ def describe_availability(dataset):
                       f"(~170 MB) into the configured data_dir"]
 
     problems = []
-    for key in ('train_txt', 'val_txt', 'test_txt'):
+    # train and test are what the pipeline reads. `test` is the balanced 50-per-class set the
+    # published accuracies are measured on; `val` is a held-out model-selection sample and is
+    # not used, so its absence is not a problem.
+    for key in ('train_txt', 'test_txt'):
         path = cfg.get(key)
         if path and not (REPO_ROOT / path).exists():
             problems.append(f"missing split file: {path}")
 
-    image_root = os.environ.get(f"{dataset.upper()}_ROOT")
+    env_var = ENV_VARS.get(dataset)
+    if env_var is None:
+        return False, [f"{cfg['name']} is not wired into this runner; it has no long-tailed "
+                       f"split definition here. Use benchmark_runner.py for it instead."]
+
+    image_root = os.environ.get(env_var)
     if not image_root:
-        problems.append(f"image directory not configured (set the {dataset.upper()}_ROOT "
-                        f"environment variable to the extracted image tree)")
+        problems.append(f"image directory not configured (set {env_var} to the extracted "
+                        f"image tree)")
     elif not Path(image_root).is_dir():
-        problems.append(f"{dataset.upper()}_ROOT points at {image_root}, which does not exist")
+        problems.append(f"{env_var} points at {image_root}, which does not exist")
 
     return (not problems), problems
 
@@ -110,22 +126,22 @@ def describe_availability(dataset):
 DOWNLOAD_NOTES = {
     'imagenet_lt': """\
 ImageNet-LT is a subset of ILSVRC-2012, which cannot be downloaded without an account.
+The split files are already in this repo; only the images are missing.
   1. Register at https://image-net.org and download ILSVRC2012_img_train.tar (~138 GB)
      and ILSVRC2012_img_val.tar (~6.3 GB).
-  2. Extract them, then point IMAGENET_LT_ROOT at the directory holding the class folders.
-  3. Fetch the split files from the OLTR release (Liu et al., 2019) and place them at
-     dataloaders/ImageNet_LT/ImageNet_LT_{train,val,test}.txt
-     https://github.com/zhmiao/OpenLongTailRecognition-OLTR
+  2. Extract them so that one directory contains both, as train/<wnid>/*.JPEG and
+     val/<wnid>/*.JPEG, then point IMAGENET_LT_ROOT at that parent directory.
+     The validation images ship in one flat folder, so they need sorting into per-wnid
+     subdirectories first (the usual valprep.sh script does this).
 Training ResNet-50 for 120 epochs on this is a multi-day job on a single GPU.""",
 
     'inaturalist': """\
-iNaturalist-2018 images are public but very large.
+iNaturalist-2018 images are public but very large. The split files are already in this repo.
   1. Download train_val2018.tar.gz (~120 GB) from
      https://ml-inat-competition-datasets.s3.amazonaws.com/2018/train_val2018.tar.gz
   2. Extract it, then point INATURALIST_ROOT at the resulting directory.
-  3. Fetch the split files from the OLTR release and place them at
-     dataloaders/Inaturalist18/iNaturalist18_{train,val,test}.txt
-Training ResNet-50 for 160 epochs on 8142 classes is a multi-day job on a single GPU.""",
+Training ResNet-50 for 160 epochs over 8142 classes is a week-scale job on a single GPU, and
+roughly 2400 of those classes fall in the tail that synthesis runs over.""",
 }
 
 
@@ -191,8 +207,14 @@ def summarize(values):
 
 def build_config(dataset, imbalance, seed, args, results_dir):
     """Config for one seed, with the benchmark protocol left untouched unless overridden."""
-    from dataloaders.cifar_lt_loader import get_num_classes
+    from dataloaders import get_num_classes
     num_classes = get_num_classes(dataset)
+
+    # ImageNet-LT and iNaturalist-2018 are long-tailed as published, so there is no ratio to
+    # apply and the loader rejects one.
+    from dataloaders import uses_imbalance_ratio
+    if not uses_imbalance_ratio(dataset):
+        imbalance = None
 
     generation = {}
     if args.prompts is not None:
@@ -206,16 +228,53 @@ def build_config(dataset, imbalance, seed, args, results_dir):
     if args.sd_low_vram is not None:
         generation['sd_low_vram'] = args.sd_low_vram
 
+    # The training schedule is a property of the benchmark, not of this script: CIFAR runs 200
+    # epochs decayed at 160/180, ImageNet-LT runs 120 decayed at 60/80. Reading it from the
+    # registry keeps a run from inheriting the wrong protocol just because CIFAR is the default.
+    protocol = get_dataset_config(dataset)
+
     return merge_config({
         'seed': seed,
         'dataset': {'name': dataset, 'num_classes': num_classes,
-                    'imbalance_ratio': imbalance, 'image_size': None},
-        'model': {'num_classes': num_classes},
+                    'imbalance_ratio': imbalance, 'image_size': None,
+                    'batch_size': args.batch or protocol['batch_size']},
+        'model': {'num_classes': num_classes,
+                  'architecture': protocol['backbone']},
+        'training': {
+            'initial_epochs': protocol['epochs'],
+            # Linear scaling: a batch size that deviates from the benchmark needs the learning
+            # rate moved with it, or the run is no longer the protocol it claims to be.
+            'lr': protocol['lr'] * (args.lr_scale or 1.0),
+            'momentum': protocol['momentum'],
+            'weight_decay': protocol['weight_decay'],
+            'scheduler_milestones': protocol['lr_decay_epochs'],
+            'scheduler_gamma': protocol['lr_decay_factor'],
+        },
         'generation': generation,
         # Each seed writes into its own results directory, so reports cannot be confused for
         # one another when they are read back.
         'paths': {'results_dir': results_dir},
     })
+
+
+def log_tail(path, max_bytes=8192):
+    """
+    Newest readable fragment of a log file, for heartbeat lines.
+
+    tqdm redraws its bars with carriage returns rather than newlines, so a progress bar
+    arrives in the file as one very long line; the current state is whatever follows the
+    last carriage return.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as handle:
+            handle.seek(max(0, size - max_bytes))
+            chunk = handle.read().decode('utf-8', errors='replace')
+    except OSError:
+        return ''
+
+    fragments = [f.strip() for f in chunk.replace('\r', '\n').split('\n') if f.strip()]
+    return fragments[-1] if fragments else '(no output yet)'
 
 
 def latest_report(results_dir):
@@ -240,7 +299,7 @@ def run_seed(dataset, imbalance, seed, args, sweep_dir):
     rounds = str(config['generation']['generation_rounds'])
 
     print(f"\n{'─' * 78}")
-    print(f"  {DATASET_CONFIGS[dataset]['name']}  imbalance {imbalance}  seed {seed}")
+    print(f"  {DATASET_CONFIGS[dataset]['name']}  {imbalance_label(imbalance)}  seed {seed}")
     print(f"  log: {log_path}")
     print(f"{'─' * 78}", flush=True)
 
@@ -252,7 +311,7 @@ def run_seed(dataset, imbalance, seed, args, sweep_dir):
 
     started = time.time()
     with open(log_path, 'w', encoding='utf-8') as log:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             [PYTHON_EXE, 'orchestrator.py',
              '--config', str(config_path),
              '--rounds', rounds,
@@ -260,10 +319,27 @@ def run_seed(dataset, imbalance, seed, args, sweep_dir):
              '--gpu', str(args.gpu)],
             cwd=str(REPO_ROOT), stdout=log, stderr=subprocess.STDOUT, env=env
         )
+
+        # A seed takes hours and writes its progress to the log rather than here, so without
+        # a heartbeat there is no way to tell a working run from a wedged one.
+        try:
+            while True:
+                try:
+                    process.wait(timeout=args.heartbeat)
+                    break
+                except subprocess.TimeoutExpired:
+                    stamp = timedelta(seconds=int(time.time() - started))
+                    print(f"    [{stamp}] {log_tail(log_path)[:100]}", flush=True)
+        except KeyboardInterrupt:
+            # Popen, unlike run, leaves the child alive when the parent is interrupted.
+            process.terminate()
+            process.wait()
+            raise
+
     elapsed = time.time() - started
 
-    if completed.returncode != 0:
-        print(f"  FAILED (exit {completed.returncode}) after {timedelta(seconds=int(elapsed))}")
+    if process.returncode != 0:
+        print(f"  FAILED (exit {process.returncode}) after {timedelta(seconds=int(elapsed))}")
         print(f"  see {log_path}")
         return None
 
@@ -312,7 +388,7 @@ def aggregate(results):
 def print_table(dataset, imbalance, results, stats):
     cfg = DATASET_CONFIGS[dataset]
     print("\n" + "=" * 78)
-    print(f"  {cfg['name']}  |  imbalance {imbalance}  |  {len(results)} seeds"
+    print(f"  {cfg['name']}  |  {imbalance_label(imbalance)}  |  {len(results)} seeds"
           f"  |  {cfg['backbone']}, {cfg['epochs']} epochs")
     print("=" * 78)
 
@@ -385,7 +461,7 @@ def write_outputs(dataset, imbalance, results, stats, sweep_dir):
     after = stats['after_overall']
     reference = LDAL_TABLE_V.get(dataset)
     lines = [
-        f"### {DATASET_CONFIGS[dataset]['name']} (imbalance {imbalance}, "
+        f"### {DATASET_CONFIGS[dataset]['name']} ({imbalance_label(imbalance)}, "
         f"{len(results)} seeds)",
         "",
         "| Method | Mean Acc. (%) | Std. Deviation (±) | 95% Confidence |",
@@ -440,7 +516,16 @@ def main():
                         help='Force weight streaming for Stable Diffusion (slow, low VRAM)')
     parser.add_argument('--no-sd-low-vram', dest='sd_low_vram', action='store_false',
                         help='Force the diffusion pipeline to stay resident on the GPU (fast)')
+    parser.add_argument('--batch', type=int, default=None,
+                        help='Override batch size. The benchmark value (256 for ImageNet-LT) '
+                             'needs roughly 24GB with ResNet-50 at 224px; halve it on a '
+                             'smaller card and scale --lr-scale to match')
+    parser.add_argument('--lr-scale', dest='lr_scale', type=float, default=None,
+                        help='Multiply the protocol learning rate, for when --batch deviates '
+                             'from the benchmark (linear scaling: half the batch, half the LR)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
+    parser.add_argument('--heartbeat', type=int, default=120,
+                        help='Seconds between progress lines while a seed runs (default: 120)')
     parser.add_argument('--out', type=str, default='./table_results',
                         help='Where to write logs, reports and the table')
     parser.add_argument('--check', action='store_true',
@@ -465,20 +550,17 @@ def main():
         return 1
 
     if dataset not in CIFAR_DATASETS:
-        print(f"\n{DATASET_CONFIGS[dataset]['name']} has its data in place, but the pipeline "
-              f"itself only builds CIFAR loaders today (orchestrator.step1). Extending it to "
-              f"this dataset is a separate piece of work.")
-        return 1
+        args.imbalance = None
 
     seeds = args.seed_list if args.seed_list else list(range(args.seeds))
 
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    sweep_dir = Path(args.out) / f"{dataset}_ir{args.imbalance}_{stamp}"
+    sweep_dir = Path(args.out) / f"{dataset}_{imbalance_label(args.imbalance)}_{stamp}"
     sweep_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = DATASET_CONFIGS[dataset]
     print("=" * 78)
-    print(f"  {cfg['name']}  |  imbalance {args.imbalance}  |  seeds {seeds}")
+    print(f"  {cfg['name']}  |  {imbalance_label(args.imbalance)}  |  seeds {seeds}")
     print(f"  {cfg['backbone']}, {cfg['image_size']}x{cfg['image_size']}, "
           f"{cfg['epochs']} epochs, lr {cfg['lr']} decayed by {cfg['lr_decay_factor']} at "
           f"{cfg['lr_decay_epochs']}, weight decay {cfg['weight_decay']}")

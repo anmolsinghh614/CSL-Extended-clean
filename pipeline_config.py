@@ -19,16 +19,22 @@ def get_default_config():
 
         # Dataset configuration
         'dataset': {
-            # 'cifar10' or 'cifar100'; both go through dataloaders/cifar_lt_loader.py so the
-            # long-tail profile matches the CSL benchmark this work is compared against.
+            # 'cifar10', 'cifar100', 'imagenet_lt' or 'inaturalist'. The CIFAR pair is
+            # subsampled to imbalance_ratio by dataloaders/cifar_lt_loader.py so the long-tail
+            # profile matches the benchmark this work is compared against; the two large
+            # datasets arrive long-tailed from their published split files instead.
             'name': 'cifar10',
-            'imbalance_ratio': 100,      # n_max / n_min, the standard CIFAR-LT setting
+            'imbalance_ratio': 100,      # n_max / n_min; ignored where the split is fixed
             'num_classes': 10,
             'batch_size': 128,
             'num_workers': 4,
-            'data_dir': './data',
-            # None takes the benchmark resolution for the chosen dataset, which is the native
-            # 32 for both CIFAR variants. Set it explicitly only to deviate from that.
+            'data_dir': './data',        # Download target for the CIFAR archives
+            # Root of a hand-extracted image tree, for ImageNet-LT and iNaturalist-2018 only.
+            # None falls back to IMAGENET_LT_ROOT / INATURALIST_ROOT, which keeps a
+            # machine-specific absolute path out of the committed config.
+            'data_root': None,
+            # None takes the benchmark resolution for the chosen dataset: the native 32 for
+            # both CIFAR variants, 224 for the two large ones.
             'image_size': None,
             'subset_seed': 42            # Fixes which images each class keeps
         },
