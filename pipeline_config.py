@@ -9,6 +9,26 @@ heavy imports so it can be read by tooling without pulling in torch.
 import copy
 
 
+def memory_bank_capacity_for(num_classes, feature_dim, budget_gb=1.5, default=256):
+    """
+    Reservoir capacity per class that keeps the memory bank inside a RAM budget.
+
+    The reservoir holds up to num_classes x capacity_per_class feature vectors. That is
+    harmless on CIFAR-10 with 64-dim features (4MB) but not on iNaturalist-2018, where 8142
+    classes of 2048-dim features at the default capacity would reserve roughly 17GB and each
+    vector is a separate Python object on top of that.
+
+    The memory bank is this pipeline's own component rather than part of any published
+    protocol, so scaling it down is a resource decision and does not affect comparability with
+    reported accuracies.
+    """
+    bytes_per_feature = feature_dim * 4
+    affordable = int(budget_gb * (1024 ** 3) / (bytes_per_feature * max(1, num_classes)))
+    # Below about 16 exemplars a class the reservoir stops being a useful sample of the
+    # distribution, so that is the floor even if it exceeds the budget.
+    return max(16, min(default, affordable))
+
+
 def get_default_config():
     """Default configuration for the full pipeline."""
     return {

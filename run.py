@@ -12,7 +12,8 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from pipeline_config import get_default_config, get_test_config, merge_config
+from pipeline_config import (get_default_config, get_test_config, merge_config,
+                            memory_bank_capacity_for)
 from dataloaders import get_num_classes, uses_imbalance_ratio
 from dataset_configs import get_dataset_config
 
@@ -99,11 +100,19 @@ def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
             print(f"Note: {protocol['name']} has a fixed long-tailed split, so "
                   f"--imbalance {imbalance} does not apply and is ignored.")
 
+    backbone = arch or protocol['backbone']
+    feature_dim = 2048 if backbone in ('ResNet50', 'ResNet101') else 64
+
     config = merge_config({
         'dataset': dataset_section,
         'model': {
             'num_classes': num_classes,
-            'architecture': arch or protocol['backbone'],
+            'architecture': backbone,
+        },
+        # 8142 classes of 2048-dim features at the CIFAR default would reserve ~17GB of
+        # reservoir, so the capacity is sized to the dataset rather than fixed.
+        'memory_bank': {
+            'capacity_per_class': memory_bank_capacity_for(num_classes, feature_dim),
         },
         'training': {
             'initial_epochs': protocol['epochs'],

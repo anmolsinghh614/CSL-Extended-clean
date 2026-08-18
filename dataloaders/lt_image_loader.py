@@ -23,6 +23,13 @@ from torchvision import transforms
 IMAGENET_STATS = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 INATURALIST_STATS = ((0.466, 0.471, 0.380), (0.195, 0.194, 0.192))
 
+# `eval_split` differs between the two, and getting it wrong produces a plausible-looking
+# number that cannot be compared with anything published:
+#   ImageNet-LT — `test` is the balanced 50-per-class set built from the ILSVRC-2012 validation
+#     images (50,000 total), which is what the literature reports on. Its `val` file is a
+#     20-per-class sample drawn from the training directory, for model selection.
+#   iNaturalist-2018 — `val` is the official 3-per-class validation set (24,426 total) that the
+#     published accuracies use. Its `test` file is unlabelled and cannot be evaluated at all.
 DATASET_SPECS = {
     'imagenet_lt': {
         'display': 'ImageNet-LT',
@@ -32,6 +39,7 @@ DATASET_SPECS = {
         'split_dir': 'ImageNet_LT',
         'split_prefix': 'ImageNet_LT',
         'env_var': 'IMAGENET_LT_ROOT',
+        'eval_split': 'test',
     },
     'inaturalist': {
         'display': 'iNaturalist-2018',
@@ -41,6 +49,7 @@ DATASET_SPECS = {
         'split_dir': 'Inaturalist18',
         'split_prefix': 'iNaturalist18',
         'env_var': 'INATURALIST_ROOT',
+        'eval_split': 'val',
     },
 }
 
@@ -262,20 +271,65 @@ def _imagenet_class_names(paths, labels, num_classes):
     return [categories[i] for i in range(num_classes)]
 
 
+# iNaturalist paths are train_val2018/<supercategory>/<category_id>/<hash>.jpg, so the
+# biological kingdom or class is recoverable even though the species name is not — that lives
+# in the competition's taxonomy JSON, which is not part of the split release. A coarse but real
+# noun gives Stable Diffusion something to work with, where a bare index would give it nothing.
+INATURALIST_SUPERCATEGORY_NOUNS = {
+    'Actinopterygii': 'fish',
+    'Amphibia': 'amphibian',
+    'Animalia': 'animal',
+    'Arachnida': 'arachnid',
+    'Aves': 'bird',
+    'Bacteria': 'bacterium',
+    'Chromista': 'alga',
+    'Fungi': 'fungus',
+    'Insecta': 'insect',
+    'Mammalia': 'mammal',
+    'Mollusca': 'mollusc',
+    'Plantae': 'plant',
+    'Protozoa': 'protozoan',
+    'Reptilia': 'reptile',
+}
+
+
+def _inaturalist_class_names(paths, labels, num_classes):
+    """
+    Coarse but real names for the 8142 iNaturalist species.
+
+    The species index is kept in the name because the pipeline uses class names as dictionary
+    keys when reporting per-class results: several thousand classes share a supercategory, and
+    collapsing them to the bare noun would silently drop all but one of each group from the
+    report.
+    """
+    supercategory_by_label = {}
+    for path, label in zip(paths, labels):
+        parts = Path(path).parts
+        if len(parts) >= 3:
+            supercategory_by_label.setdefault(label, parts[1])
+
+    names = []
+    for i in range(num_classes):
+        supercategory = supercategory_by_label.get(i)
+        noun = INATURALIST_SUPERCATEGORY_NOUNS.get(supercategory)
+        names.append(f"{noun} species {i}" if noun else f"class_{i}")
+    return names
+
+
 def build_class_names(dataset, paths, labels, num_classes):
     """Human-readable class names, used to condition prompt generation."""
-    if normalize_name(dataset) == 'imagenet_lt':
+    name = normalize_name(dataset)
+    if name == 'imagenet_lt':
         return _imagenet_class_names(paths, labels, num_classes)
-    # iNaturalist labels are species indices; the readable names live in the competition's
-    # taxonomy JSON, which is not part of the split release. Numeric names degrade prompt
-    # quality but keep everything else working.
+    if name == 'inaturalist':
+        return _inaturalist_class_names(paths, labels, num_classes)
     return [f"class_{i}" for i in range(num_classes)]
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
 
 def get_lt_image_loaders(dataset, batch_size=256, num_workers=8, data_root=None,
-                         image_size=None, imbalance_ratio=None, eval_split='test',
+                         image_size=None, imbalance_ratio=None, eval_split=None,
                          **_ignored):
     """
     Build long-tailed loaders for ImageNet-LT or iNaturalist-2018.
@@ -283,11 +337,8 @@ def get_lt_image_loaders(dataset, batch_size=256, num_workers=8, data_root=None,
     Returns the same bundle as `get_cifar_lt_loaders`: train, train_eval and test loaders,
     class names, per-class sample counts, class count and the resolution used.
 
-    Evaluation defaults to the `test` split, which despite the name is the balanced set the
-    published accuracies are measured on — 50 images per class drawn from the ILSVRC-2012
-    validation images. The `val` split is a smaller held-out sample taken from the training
-    directory, 20 per class, intended for model selection; using it would produce numbers that
-    cannot be compared with anything in the literature.
+    `eval_split` defaults to whichever split each benchmark's published accuracies are measured
+    on, which is not the same file name for both — see DATASET_SPECS above.
 
     `imbalance_ratio` is accepted only so callers can pass a uniform argument list; the
     imbalance is fixed by the published split and cannot be varied, so a value is rejected
@@ -307,6 +358,8 @@ def get_lt_image_loaders(dataset, batch_size=256, num_workers=8, data_root=None,
     root = resolve_data_root(name, data_root)
     if image_size is None:
         image_size = spec['image_size']
+    if eval_split is None:
+        eval_split = spec['eval_split']
     num_classes = spec['num_classes']
 
     train_paths, train_labels = read_split(name, 'train')

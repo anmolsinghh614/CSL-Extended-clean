@@ -30,7 +30,7 @@ from pathlib import Path
 # torch stack — several seconds of load for subcommands like --check that just read dicts and
 # look for files on disk.
 from dataset_configs import DATASET_CONFIGS, get_dataset_config
-from pipeline_config import merge_config
+from pipeline_config import merge_config, memory_bank_capacity_for
 
 for _stream in (sys.stdout, sys.stderr):
     if hasattr(_stream, 'reconfigure'):
@@ -46,11 +46,24 @@ LDAL_TABLE_V = {
     'inaturalist': {'mean': 66.53, 'std': 0.83, 'ci': (65.80, 67.25)},
 }
 
-# The paper reports the *best* single run in its comparison tables and the multi-seed spread
-# separately, so both are worth having in view.
+# The paper reports the *best* single run in its comparison tables (I and III) and the
+# multi-seed spread separately (V), so both are worth having in view. `None` keys the datasets
+# whose imbalance is fixed by their split.
 LDAL_BEST = {
     'cifar10': {100: 80.19, 50: 84.41},
     'cifar100': {200: 45.04, 100: 49.79, 50: 52.72},
+    'imagenet_lt': {None: 50.10},
+    'inaturalist': {None: 67.10},
+}
+
+# Cross-entropy under the same protocol, from the paper's baseline rows. Our own
+# "before synthesis" number is the more direct comparison, but this says whether the backbone
+# and schedule are behaving at all.
+CE_BASELINE = {
+    'cifar10': {100: 70.40, 50: 74.80},
+    'cifar100': {200: 34.84, 100: 38.32, 50: 43.85},
+    'imagenet_lt': {None: 38.88},
+    'inaturalist': {None: 57.30},
 }
 
 CIFAR_DATASETS = ('cifar10', 'cifar100')
@@ -100,13 +113,14 @@ def describe_availability(dataset):
                       f"(~170 MB) into the configured data_dir"]
 
     problems = []
-    # train and test are what the pipeline reads. `test` is the balanced 50-per-class set the
-    # published accuracies are measured on; `val` is a held-out model-selection sample and is
-    # not used, so its absence is not a problem.
-    for key in ('train_txt', 'test_txt'):
-        path = cfg.get(key)
-        if path and not (REPO_ROOT / path).exists():
-            problems.append(f"missing split file: {path}")
+    # Which splits are needed differs per dataset, so ask the loader rather than assuming:
+    # ImageNet-LT evaluates on `test`, iNaturalist-2018 on `val`.
+    from dataloaders import lt_image_loader
+    eval_split = lt_image_loader.DATASET_SPECS[dataset]['eval_split']
+    for split in ('train', eval_split):
+        path = lt_image_loader.split_path(dataset, split)
+        if not path.exists():
+            problems.append(f"missing split file: {path.relative_to(REPO_ROOT)}")
 
     env_var = ENV_VARS.get(dataset)
     if env_var is None:
@@ -131,17 +145,22 @@ The split files are already in this repo; only the images are missing.
      and ILSVRC2012_img_val.tar (~6.3 GB).
   2. Extract them so that one directory contains both, as train/<wnid>/*.JPEG and
      val/<wnid>/*.JPEG, then point IMAGENET_LT_ROOT at that parent directory.
-     The validation images ship in one flat folder, so they need sorting into per-wnid
-     subdirectories first (the usual valprep.sh script does this).
-Training ResNet-50 for 120 epochs on this is a multi-day job on a single GPU.""",
+       The train archive contains 1000 inner tars that each need unpacking into their own
+       directory, and the validation images ship in one flat folder that needs sorting into
+       per-wnid subdirectories (the usual valprep.sh script does this).
+Training ResNet-50 for 120 epochs on this is a multi-day job on a single GPU.
+See LARGE_DATASET_RUNBOOK.md for the full procedure.""",
 
     'inaturalist': """\
 iNaturalist-2018 images are public but very large. The split files are already in this repo.
   1. Download train_val2018.tar.gz (~120 GB) from
      https://ml-inat-competition-datasets.s3.amazonaws.com/2018/train_val2018.tar.gz
-  2. Extract it, then point INATURALIST_ROOT at the resulting directory.
+  2. Extract it. The archive creates a train_val2018/ directory, and the split paths already
+     begin with that name, so INATURALIST_ROOT must point at the directory *containing*
+     train_val2018 rather than at train_val2018 itself.
 Training ResNet-50 for 160 epochs over 8142 classes is a week-scale job on a single GPU, and
-roughly 2400 of those classes fall in the tail that synthesis runs over.""",
+roughly 2400 of those classes fall in the tail that synthesis runs over.
+See LARGE_DATASET_RUNBOOK.md for the full procedure.""",
 }
 
 
@@ -156,6 +175,10 @@ def print_availability():
         print(f"\n{cfg['name']:<20} {status}")
         print(f"  {cfg['num_classes']} classes, {cfg['image_size']}x{cfg['image_size']}, "
               f"{cfg['backbone']}, {cfg['epochs']} epochs")
+        if dataset in ENV_VARS:
+            from dataloaders import lt_image_loader
+            print(f"  evaluated on the '"
+                  f"{lt_image_loader.DATASET_SPECS[dataset]['eval_split']}' split")
         for note in notes:
             print(f"  - {note}")
         if not ready and dataset in DOWNLOAD_NOTES:
@@ -233,6 +256,11 @@ def build_config(dataset, imbalance, seed, args, results_dir):
     # registry keeps a run from inheriting the wrong protocol just because CIFAR is the default.
     protocol = get_dataset_config(dataset)
 
+    # ResNet-50 produces 2048-dim features against ResNet-32's 64, and these datasets have up
+    # to 8142 classes, so the reservoir has to be sized rather than left at the CIFAR default.
+    feature_dim = 2048 if protocol['backbone'] in ('ResNet50', 'ResNet101') else 64
+    capacity = memory_bank_capacity_for(protocol['num_classes'], feature_dim)
+
     return merge_config({
         'seed': seed,
         'dataset': {'name': dataset, 'num_classes': num_classes,
@@ -250,6 +278,7 @@ def build_config(dataset, imbalance, seed, args, results_dir):
             'scheduler_milestones': protocol['lr_decay_epochs'],
             'scheduler_gamma': protocol['lr_decay_factor'],
         },
+        'memory_bank': {'capacity_per_class': capacity},
         'generation': generation,
         # Each seed writes into its own results directory, so reports cannot be confused for
         # one another when they are read back.
@@ -433,6 +462,11 @@ def print_table(dataset, imbalance, results, stats):
         best_of_ours = max(r['after']['overall'] for r in results)
         print(f"\n  Best single run: ours {best_of_ours:.2f}% vs LDAL {best:.2f}% "
               f"({best_of_ours - best:+.2f} pp)")
+
+    ce = CE_BASELINE.get(dataset, {}).get(imbalance)
+    if ce is not None and after:
+        print(f"  Cross-entropy baseline under this protocol: {ce:.2f}% "
+              f"(ours is {after['mean'] - ce:+.2f} pp against it)")
 
     print("\n" + "=" * 78)
 
