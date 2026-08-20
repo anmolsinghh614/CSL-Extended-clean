@@ -57,28 +57,33 @@ bottleneck rather than the GPU, so if `nproc` gives you plenty, more workers hel
 Public, so it needs no account and can run unattended while you deal with ImageNet
 registration. Do it in tmux — this takes hours.
 
+Download *outside* the repo. `/data` needs root on most machines, so use your home directory —
+and note that starting `wget` from wherever your shell happens to sit will drop 120GB into the
+repository, which is a nuisance to undo afterwards.
+
 ```bash
-mkdir -p /data/inat && cd /data/inat
+mkdir -p "$HOME/data/inat" && cd "$HOME/data/inat"
 tmux new -s dl-inat
 wget -c https://ml-inat-competition-datasets.s3.amazonaws.com/2018/train_val2018.tar.gz
 ```
 
 `-c` resumes a partial download, so a dropped connection is not fatal. Ctrl+B then D to detach.
 
-When it finishes:
+When it finishes, extract inside tmux as well — unpacking 120GB of gzip takes hours:
 
 ```bash
-cd /data/inat
-tar -xzf train_val2018.tar.gz
-rm train_val2018.tar.gz            # only after you confirm the extraction worked
+cd "$HOME/data/inat"
+tar -xzf train_val2018.tar.gz      # gzip verifies checksums, so corruption fails loudly here
 ls train_val2018                   # expect Actinopterygii, Amphibia, Animalia, Aves, ...
+du -sh train_val2018
+rm train_val2018.tar.gz            # only after you confirm the extraction worked
 ```
 
 **The root path is the parent.** The split files already begin with `train_val2018/`, so:
 
 ```bash
-export INATURALIST_ROOT=/data/inat        # correct — contains train_val2018/
-# NOT /data/inat/train_val2018
+export INATURALIST_ROOT="$HOME/data/inat"     # correct — contains train_val2018/
+# NOT $HOME/data/inat/train_val2018
 ```
 
 ## 3. Download ImageNet
@@ -92,7 +97,7 @@ Both need rearranging into the layout the split files expect.
 to be unpacked into its own directory:
 
 ```bash
-mkdir -p /data/imagenet/train && cd /data/imagenet/train
+mkdir -p "$HOME/data/imagenet/train" && cd "$HOME/data/imagenet/train"
 tar -xf /path/to/ILSVRC2012_img_train.tar
 for f in *.tar; do
   d="${f%.tar}"; mkdir -p "$d"; tar -xf "$f" -C "$d"; rm "$f"
@@ -104,7 +109,7 @@ ls | wc -l                          # expect 1000
 directories:
 
 ```bash
-mkdir -p /data/imagenet/val && cd /data/imagenet/val
+mkdir -p "$HOME/data/imagenet/val" && cd "$HOME/data/imagenet/val"
 tar -xf /path/to/ILSVRC2012_img_val.tar
 wget -qO- https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh | bash
 ls | wc -l                          # expect 1000, not 50000
@@ -113,7 +118,7 @@ ls | wc -l                          # expect 1000, not 50000
 Then point at the parent holding both:
 
 ```bash
-export IMAGENET_LT_ROOT=/data/imagenet    # contains train/ and val/
+export IMAGENET_LT_ROOT="$HOME/data/imagenet"    # contains train/ and val/
 ```
 
 ## 4. Make the paths stick
@@ -123,8 +128,8 @@ starts and then cannot find its data has wasted your queue slot:
 
 ```bash
 cat >> ~/.bashrc <<'EOF'
-export IMAGENET_LT_ROOT=/data/imagenet
-export INATURALIST_ROOT=/data/inat
+export IMAGENET_LT_ROOT="$HOME/data/imagenet"
+export INATURALIST_ROOT="$HOME/data/inat"
 EOF
 source ~/.bashrc
 ```

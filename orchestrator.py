@@ -1371,26 +1371,77 @@ class MemoryConditionedOrchestrator:
         return transform(image)
     
     def _save_checkpoint(self, epoch, accuracy, synthetic=False):
-        """Save model checkpoint."""
+        """
+        Save the model checkpoint, keeping only the most recent of each kind.
+
+        Validation accuracy improves many times over a long run, and each ResNet-50 checkpoint
+        is ~100MB, so retaining every improvement filled the disk on the large benchmarks. Only
+        the latest is kept, which is all the pipeline ever reloads. A write failure warns rather
+        than aborting: losing a checkpoint must not throw away hours of completed training.
+        """
         prefix = "synthetic_" if synthetic else ""
         checkpoint_path = os.path.join(
             self.config['paths']['checkpoint_dir'],
             f"{prefix}model_epoch{epoch}_acc{accuracy:.2f}.pt"
         )
         
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'accuracy': accuracy,
-            'config': self.config
-        }, checkpoint_path)
+        try:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'accuracy': accuracy,
+                'config': self.config
+            }, checkpoint_path)
+        except OSError as error:
+            print(f"  Warning: could not save checkpoint ({error}); continuing training")
+            return
+        
+        # Delete the previously kept checkpoint only now that the new one is safely written, so
+        # an interrupted save never leaves zero checkpoints on disk.
+        if not hasattr(self, '_last_checkpoint_paths'):
+            self._last_checkpoint_paths = {}
+        previous = self._last_checkpoint_paths.get(prefix)
+        if previous and previous != checkpoint_path and os.path.exists(previous):
+            try:
+                os.remove(previous)
+            except OSError:
+                pass
+        self._last_checkpoint_paths[prefix] = checkpoint_path
         
         print(f"  Checkpoint saved: {checkpoint_path}")
     
+    @staticmethod
+    def _remove_checkpoint_group(pt_path):
+        """Delete a memory-bank .pt along with the summary/stats JSON written beside it."""
+        for path in (pt_path, pt_path.replace('.pt', '_summary.json'),
+                     pt_path.replace('.pt', '_stats.json')):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+    
     def _save_memory_bank(self, epoch):
-        """Save memory bank state."""
-        memory_path = self.memory_manager.save_memory(epoch, prefix="memory_bank")
+        """
+        Save the memory bank, keeping only the most recent.
+
+        Each save is num_classes x capacity x feature_dim floats — about 1.6GB on
+        iNaturalist-2018 — and the 5-epoch cadence over a long run accumulates enough of these
+        to fill the disk. The intermediate banks are diagnostic and never reloaded mid-run, so
+        only the latest is retained.
+        """
+        try:
+            memory_path = self.memory_manager.save_memory(epoch, prefix="memory_bank")
+        except OSError as error:
+            print(f"  Warning: could not save memory bank ({error}); continuing training")
+            return
+        
+        previous = getattr(self, '_last_memory_path', None)
+        if previous and previous != memory_path:
+            self._remove_checkpoint_group(previous)
+        self._last_memory_path = memory_path
+        
         print(f"  Memory bank saved: {memory_path}")
     
     def _save_tail_analysis(self, analysis):

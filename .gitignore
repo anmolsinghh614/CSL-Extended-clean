@@ -20,7 +20,14 @@ data/
 datasets/
 balanced_dataset/
 *.tar.gz
+*.tar
 *.zip
+
+# The large benchmarks are hundreds of gigabytes and are meant to live outside the repo, but
+# they are easy to unpack in place by accident, and staging 437,000 images is not a mistake you
+# want to make interactively.
+train_val2018/
+ILSVRC2012*/
 
 # ── Model checkpoints & weights ───────────────────────────────────────────────
 *.pt
