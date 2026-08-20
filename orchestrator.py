@@ -1385,6 +1385,10 @@ class MemoryConditionedOrchestrator:
             f"{prefix}model_epoch{epoch}_acc{accuracy:.2f}.pt"
         )
         
+        # torch.save raises RuntimeError (from PytorchStreamWriter), not OSError, when a write
+        # fails partway — which is what a transient full on a shared disk looks like. Both are
+        # caught so a failed diagnostic checkpoint warns instead of killing a multi-day run. A
+        # partial file may be left behind, so it is removed before we give up on it.
         try:
             torch.save({
                 'epoch': epoch,
@@ -1393,8 +1397,13 @@ class MemoryConditionedOrchestrator:
                 'accuracy': accuracy,
                 'config': self.config
             }, checkpoint_path)
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             print(f"  Warning: could not save checkpoint ({error}); continuing training")
+            if os.path.exists(checkpoint_path):
+                try:
+                    os.remove(checkpoint_path)
+                except OSError:
+                    pass
             return
         
         # Delete the previously kept checkpoint only now that the new one is safely written, so
@@ -1431,10 +1440,16 @@ class MemoryConditionedOrchestrator:
         to fill the disk. The intermediate banks are diagnostic and never reloaded mid-run, so
         only the latest is retained.
         """
+        # As in _save_checkpoint, a partial write surfaces as RuntimeError from torch.save,
+        # while the companion JSON writes raise OSError; both must leave the run running. Any
+        # half-written file is cleared so it cannot be mistaken for a complete bank later.
         try:
             memory_path = self.memory_manager.save_memory(epoch, prefix="memory_bank")
-        except OSError as error:
+        except (OSError, RuntimeError) as error:
             print(f"  Warning: could not save memory bank ({error}); continuing training")
+            partial = os.path.join(self.memory_manager.save_dir,
+                                   f"memory_bank_step_{epoch}.pt")
+            self._remove_checkpoint_group(partial)
             return
         
         previous = getattr(self, '_last_memory_path', None)
