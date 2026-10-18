@@ -149,16 +149,22 @@ def run_full_training():
                             "ResNet50 for ImageNet-LT and iNaturalist)")
     parser.add_argument('--imbalance', type=int, default=None,
                        help='Imbalance ratio for the CIFAR benchmarks (default: 100)')
+    parser.add_argument('--loss', choices=['ldal', 'csl'], default=None,
+                       help="Loss function: 'ldal' (default) or 'csl'")
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
     args = parser.parse_args(sys.argv[2:])  # Skip 'run.py full'
     
     print("🔥 Running Full Training Mode...")
     print("This will run the complete pipeline with optimal settings.")
     
-    config = _dataset_config(args.dataset, args.arch, args.imbalance)
+    overrides = {}
+    if args.loss:
+        overrides['training'] = {'loss_type': args.loss}
+    config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides=overrides)
     print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
     print(f"  Backbone: {config['model']['architecture']}")
     print(f"  Imbalance ratio: {config['dataset']['imbalance_ratio']}")
+    print(f"  Loss function: {config['training'].get('loss_type', 'ldal').upper()}")
     
     config_path = _write_config(
         config, f'full_config_{args.dataset}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
@@ -205,6 +211,8 @@ def run_custom():
     parser.add_argument('--no-stable-diffusion', dest='stable_diffusion',
                        action='store_false', default=None,
                        help='Skip Stable Diffusion image synthesis (much faster)')
+    parser.add_argument('--loss', choices=['ldal', 'csl'], default=None,
+                       help="Loss function: 'ldal' (default) or 'csl'")
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU device ID (default: 0)')
     
@@ -217,7 +225,8 @@ def run_custom():
     # the orchestrator's bare-argument path.
     config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides={
         'training': section(initial_epochs=args.epochs,
-                            synthetic_epochs=args.synthetic_epochs),
+                            synthetic_epochs=args.synthetic_epochs,
+                            loss_type=args.loss),
         'generation': section(num_prompts_per_tail_class=args.prompts,
                               images_per_prompt=args.images,
                               generation_rounds=args.rounds,
@@ -233,6 +242,7 @@ def run_custom():
     print(f"  Backbone: {config['model']['architecture']}")
     print(f"  Imbalance ratio: {config['dataset']['imbalance_ratio']}")
     print(f"  Initial epochs: {training['initial_epochs']}")
+    print(f"  Loss function: {training.get('loss_type', 'ldal').upper()}")
     print(f"  Synthetic epochs: {training['synthetic_epochs']}")
     print(f"  Improvement rounds: {generation['generation_rounds']}")
     print(f"  Prompts per class: {generation['num_prompts_per_tail_class']}")

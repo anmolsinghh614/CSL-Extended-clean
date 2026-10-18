@@ -79,6 +79,10 @@ def get_default_config():
         # Optimizer settings follow the standard long-tailed CIFAR protocol (LDAM-DRW ->
         # AREA -> LDAL), so a number produced here is comparable to the published ones.
         'training': {
+            'loss_type': 'ldal',          # 'ldal' (paper1 SOTA) or 'csl' (legacy baseline)
+            'ldal_tau': 5.0,              # LDAL dynamic importance cap tau (Eq. 4)
+            'ldal_alpha': 1.0,            # LDAL inter-epoch regularizer strength alpha (Eq. 5)
+            'ldal_epsilon': 1.0,          # LDAL denominator stability epsilon (Eq. 1)
             'initial_epochs': 200,
             'synthetic_epochs': 25,       # Enough to integrate synthetic features
             'lr': 0.1,

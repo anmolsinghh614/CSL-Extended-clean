@@ -40,7 +40,7 @@ from pipeline_config import get_default_config, merge_config
 from dataloaders import (get_lt_loaders, get_default_image_size, get_normalization,
                          get_num_classes, uses_imbalance_ratio)
 from models import ResNet32, ResNet34, ResNet50
-from utils import CSLLossFunc
+from utils import CSLLossFunc, LDALLossFunc
 from utils.memory_manager import MemoryManager
 from utils.visual_exemplar_prompt_generator import VisualExemplarPromptGenerator
 
@@ -236,6 +236,36 @@ class MemoryConditionedOrchestrator:
                   f"medium: {num_classes - len(self.head_classes) - len(self.tail_classes)}")
         
         return self.train_loader.dataset, samples_per_class
+
+    def _build_criterion(self, samples_per_class=None):
+        """
+        Build the classification loss function based on config.
+        Supports:
+            - 'ldal': Learning-Dynamics Aware Loss (arXiv:2607.25830)
+            - 'csl': Legacy Cost-Sensitive Loss
+        """
+        loss_type = self.config['training'].get('loss_type', 'ldal').lower()
+        num_classes = self.config['model']['num_classes']
+        
+        if loss_type == 'ldal':
+            tau = self.config['training'].get('ldal_tau', 5.0)
+            alpha = self.config['training'].get('ldal_alpha', 1.0)
+            epsilon = self.config['training'].get('ldal_epsilon', 1.0)
+            print(f"Using LDALLossFunc (tau={tau}, alpha={alpha}, epsilon={epsilon})")
+            return LDALLossFunc(
+                target_minority_classes=self.tail_classes,
+                num_classes=num_classes,
+                tau=tau,
+                alpha=alpha,
+                epsilon=epsilon
+            ).to(self.device)
+        else:
+            print("Using legacy CSLLossFunc")
+            return CSLLossFunc(
+                target_class_index=self.tail_classes,
+                num_classes=num_classes,
+                samples_per_class=samples_per_class
+            ).to(self.device)
     
     def step2_train_memory_bank(self, epochs=20):
         """Step 2: Train model with memory bank on imbalanced dataset."""
@@ -279,12 +309,8 @@ class MemoryConditionedOrchestrator:
             tail_refresh_interval=self.config['memory_bank']['tail_refresh_interval']
         )
         
-        # Initialize CSL loss with class-balanced weights
-        self.criterion = CSLLossFunc(
-            target_class_index=self.tail_classes,
-            num_classes=self.config['model']['num_classes'],
-            samples_per_class=self.samples_per_class
-        ).to(self.device)
+        # Initialize loss criterion (LDAL or CSL depending on config)
+        self.criterion = self._build_criterion(self.samples_per_class)
         
         # Initialize optimizer
         self.optimizer = optim.SGD(
@@ -1056,11 +1082,7 @@ class MemoryConditionedOrchestrator:
         else:
             effective_counts = self.samples_per_class
         
-        criterion = CSLLossFunc(
-            target_class_index=self.tail_classes,
-            num_classes=num_classes,
-            samples_per_class=effective_counts
-        ).to(self.device)
+        criterion = self._build_criterion(effective_counts)
         
         print(f"\nTraining with augmented data for {epochs} epochs...")
         best_tail_acc = baseline_tail_acc
