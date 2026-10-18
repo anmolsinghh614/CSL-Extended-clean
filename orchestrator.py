@@ -110,6 +110,9 @@ class MemoryConditionedOrchestrator:
         # Replaced with the dataset's real label names in step 1; placeholders until then so
         # that anything logging a class can do so before the data is loaded.
         self.class_names = [f"class_{i}" for i in range(self.config['model']['num_classes'])]
+        self.tail_classes = []
+        self.head_classes = []
+        self.samples_per_class = []
         
         # Setup directories
         self._setup_directories()
@@ -247,13 +250,14 @@ class MemoryConditionedOrchestrator:
         loss_type = self.config['training'].get('loss_type', 'ldal').lower()
         num_classes = self.config['model']['num_classes']
         
+        tail_classes = getattr(self, 'tail_classes', [])
         if loss_type == 'ldal':
             tau = self.config['training'].get('ldal_tau', 5.0)
             alpha = self.config['training'].get('ldal_alpha', 1.0)
             epsilon = self.config['training'].get('ldal_epsilon', 1.0)
             print(f"Using LDALLossFunc (tau={tau}, alpha={alpha}, epsilon={epsilon})")
             return LDALLossFunc(
-                target_minority_classes=self.tail_classes,
+                target_minority_classes=tail_classes,
                 num_classes=num_classes,
                 tau=tau,
                 alpha=alpha,
@@ -262,7 +266,7 @@ class MemoryConditionedOrchestrator:
         else:
             print("Using legacy CSLLossFunc")
             return CSLLossFunc(
-                target_class_index=self.tail_classes,
+                target_class_index=tail_classes,
                 num_classes=num_classes,
                 samples_per_class=samples_per_class
             ).to(self.device)
