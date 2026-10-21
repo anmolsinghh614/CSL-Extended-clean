@@ -153,17 +153,21 @@ def run_full_training():
                        help="Loss function: 'ldal' (default) or 'csl'")
     parser.add_argument('--image-size', type=int, default=None,
                        help='Input image resolution (e.g. 224 for LDAL paper setup)')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Batch size (e.g. 256 for LDAL paper setup)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
     args = parser.parse_args(sys.argv[2:])  # Skip 'run.py full'
     
     print("🔥 Running Full Training Mode...")
     print("This will run the complete pipeline with optimal settings.")
     
-    overrides = {}
+    overrides = {'dataset': {}, 'training': {}}
     if args.loss:
-        overrides['training'] = {'loss_type': args.loss}
+        overrides['training']['loss_type'] = args.loss
     if args.image_size:
-        overrides['dataset'] = {'image_size': args.image_size}
+        overrides['dataset']['image_size'] = args.image_size
+    if args.batch_size:
+        overrides['dataset']['batch_size'] = args.batch_size
     config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides=overrides)
     print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
     print(f"  Backbone: {config['model']['architecture']}")
@@ -219,6 +223,8 @@ def run_custom():
                        help="Loss function: 'ldal' (default) or 'csl'")
     parser.add_argument('--image-size', type=int, default=None,
                        help='Input image resolution (e.g. 224 for LDAL paper setup)')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Batch size (e.g. 256 for LDAL paper setup)')
     parser.add_argument('--weight-decay', type=float, default=None,
                        help='Weight decay (default: benchmark protocol)')
     parser.add_argument('--gpu', type=int, default=0,
@@ -232,7 +238,7 @@ def run_custom():
     # Build a real config so custom runs get the same defaults as the full run, rather than
     # the orchestrator's bare-argument path.
     config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides={
-        'dataset': section(image_size=args.image_size),
+        'dataset': section(image_size=args.image_size, batch_size=args.batch_size),
         'training': section(initial_epochs=args.epochs,
                             synthetic_epochs=args.synthetic_epochs,
                             loss_type=args.loss,
@@ -250,6 +256,7 @@ def run_custom():
     print(f"🎯 Running with custom settings:")
     print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
     print(f"  Backbone: {config['model']['architecture']}")
+    print(f"  Batch size: {config['dataset']['batch_size']}")
     print(f"  Imbalance ratio: {config['dataset']['imbalance_ratio']}")
     print(f"  Initial epochs: {training['initial_epochs']}")
     print(f"  Loss function: {training.get('loss_type', 'ldal').upper()}")

@@ -520,12 +520,15 @@ class MemoryConditionedOrchestrator:
         self.metrics['head_group_accuracies'][-1] = \
             self._group_accuracy(class_accuracies, self.head_classes)
     
-    def step3_generate_prompts(self):
+    def step3_generate_prompts(self, target_classes=None):
         """Step 3: Generate prompts using Option 3 (BLIP+CLIP)."""
         print("\n" + "="*80)
         print("STEP 3: GENERATING PROMPTS USING OPTION 3 (BLIP+CLIP)")
         print("="*80)
         
+        if target_classes is None:
+            target_classes = self.tail_classes
+            
         # Initialize Option 3 generator once and reuse it across rounds; CLIP and BLIP are
         # several hundred megabytes each and reloading them per round is pure overhead.
         if getattr(self, 'prompt_generator', None) is None:
@@ -543,12 +546,12 @@ class MemoryConditionedOrchestrator:
             )
         
         num_exemplars = self.config['generation']['num_exemplars_per_tail_class']
-        exemplars = self._select_tail_exemplar_images(num_exemplars)
+        exemplars = self._select_tail_exemplar_images(target_classes=target_classes, num_exemplars=num_exemplars)
         
         all_prompts = {}
         all_captions = {}
         
-        for cls_idx in self.tail_classes:
+        for cls_idx in target_classes:
             print(f"\nGenerating prompts for class {cls_idx} ({self.class_names[cls_idx]})...")
             
             class_exemplars = exemplars.get(cls_idx, [])
@@ -593,9 +596,9 @@ class MemoryConditionedOrchestrator:
         
         return all_prompts
     
-    def _select_tail_exemplar_images(self, num_exemplars=5):
+    def _select_tail_exemplar_images(self, target_classes=None, num_exemplars=5):
         """
-        Pick the real training images that best represent each tail class.
+        Pick the real training images that best represent each target class.
         
         The memory bank's EMA prototype defines what the model currently believes the class
         looks like; the images whose features sit closest to it are the class's visual
@@ -605,16 +608,19 @@ class MemoryConditionedOrchestrator:
         Returns:
             Dict[class_id -> list of normalized image tensors]
         """
-        print(f"\nSelecting {num_exemplars} visual exemplars per tail class from memory prototypes...")
+        if target_classes is None:
+            target_classes = self.tail_classes
+            
+        print(f"\nSelecting {num_exemplars} visual exemplars per target class from memory prototypes...")
         
-        tail_classes = set(self.tail_classes)
+        target_set = set(target_classes)
         prototypes = {
             cls: F.normalize(self.memory_manager.memory_bank.get_prototype(cls).flatten(), dim=0)
-            for cls in tail_classes
+            for cls in target_set
         }
         
         # Keep only the running best-k per class rather than every candidate
-        best = {cls: [] for cls in tail_classes}
+        best = {cls: [] for cls in target_set}
         
         self.model.eval()
         with torch.no_grad():
@@ -623,7 +629,7 @@ class MemoryConditionedOrchestrator:
                 _, features = self.model(inputs_device, return_features=True)
                 features = F.normalize(features, dim=1)
                 
-                for cls in tail_classes:
+                for cls in target_set:
                     mask = labels == cls
                     if not bool(mask.any()):
                         continue
@@ -691,12 +697,15 @@ class MemoryConditionedOrchestrator:
         
         return generated_images
     
-    def step5_extract_features(self, images=None):
+    def step5_extract_features(self, images=None, target_classes=None):
         """Step 5: Extract features from synthetic images and train DDPM."""
         print("\n" + "="*80)
         print("STEP 5: EXTRACTING FEATURES (INCLUDING DDPM)")
         print("="*80)
         
+        if target_classes is None:
+            target_classes = self.tail_classes
+            
         synthetic_features = {}
         
         # The synthetic features must describe the same feature space the classifier will be
@@ -739,7 +748,7 @@ class MemoryConditionedOrchestrator:
         # Train DDPM for additional feature generation
         if self.config['ddpm']['enabled']:
             print("\nTraining DDPM for feature generation...")
-            ddpm_features = self._train_and_generate_ddpm_features(self.real_features)
+            ddpm_features = self._train_and_generate_ddpm_features(self.real_features, target_classes=target_classes)
             
             # Combine features
             for cls_idx, features in ddpm_features.items():
@@ -841,7 +850,7 @@ class MemoryConditionedOrchestrator:
     
     def _synthetic_budget(self, cls_idx):
         """
-        How many synthetic features to keep for one tail class.
+        How many synthetic features to keep for one target class.
         
         Two bounds apply. The class should be lifted to a typical class count and no further,
         since the goal is to remove the imbalance rather than to invert it. And the amount
@@ -854,8 +863,9 @@ class MemoryConditionedOrchestrator:
         
         target = int(np.percentile(self.samples_per_class,
                                    ddpm_config['balance_target_percentile']))
-        budget = max(0, target - real_count)
-        budget = min(budget, int(ddpm_config['max_synthetic_ratio'] * real_count))
+        # Ensure a floor of 25 features for any targeted class to deliver a meaningful boost
+        budget = max(25, target - real_count)
+        budget = min(budget, max(30, int(ddpm_config['max_synthetic_ratio'] * real_count)))
         
         return min(budget, int(ddpm_config['features_per_class']))
     
@@ -873,15 +883,17 @@ class MemoryConditionedOrchestrator:
             return self.model.fc
         raise AttributeError("Could not find classifier (.fc) in model")
     
-    def _train_and_generate_ddpm_features(self, real_features):
+    def _train_and_generate_ddpm_features(self, real_features, target_classes=None):
         """Train DDPM model and generate additional features."""
+        if target_classes is None:
+            target_classes = self.tail_classes
         ddpm_config = self.config['ddpm']
         
-        # Create training dataset for DDPM
+        # Create training dataset for DDPM from the target classes
         all_features = []
         all_labels = []
         
-        for cls_idx in self.tail_classes:
+        for cls_idx in target_classes:
             features = real_features.get(cls_idx)
             if features is None or len(features) == 0:
                 continue
@@ -937,18 +949,18 @@ class MemoryConditionedOrchestrator:
         # Class means in raw feature space, used to score how plausible a sample is
         prototypes = {
             cls_idx: real_features[cls_idx].mean(dim=0)
-            for cls_idx in self.tail_classes
+            for cls_idx in target_classes
             if cls_idx in real_features and len(real_features[cls_idx]) > 0
         }
         
-        # Generate features for tail classes
-        print("  Generating DDPM features for tail classes...")
+        # Generate features for target classes
+        print(f"  Generating DDPM features for {len(target_classes)} target classes...")
         ddpm_features = {}
         oversample = max(1.0, float(ddpm_config['oversample_factor']))
         min_confidence = float(ddpm_config['min_confidence'])
         
         ddpm_model.eval()
-        for cls_idx in self.tail_classes:
+        for cls_idx in target_classes:
             if cls_idx not in prototypes:
                 continue
             
@@ -1096,7 +1108,6 @@ class MemoryConditionedOrchestrator:
         print(f"\nTraining with augmented data for {epochs} epochs...")
         best_tail_acc = baseline_tail_acc
         best_val_acc = baseline_acc
-        best_score = baseline_acc + 0.5 * baseline_tail_acc
         best_state = None
         best_epoch = None
         epochs_without_gain = 0
@@ -1164,12 +1175,13 @@ class MemoryConditionedOrchestrator:
             print(f"    Tail Classes Accuracy: {tail_acc:.2f}% (baseline {baseline_tail_acc:.2f}%)")
             print(f"    Head Classes Accuracy: {head_acc:.2f}% (baseline {baseline_head_acc:.2f}%)")
             
-            # Optimize overall benchmark accuracy while maintaining/improving tail accuracy
-            score = val_acc + 0.5 * tail_acc
-            is_better = (score > best_score and tail_acc >= baseline_tail_acc) or (val_acc > best_val_acc and tail_acc >= baseline_tail_acc)
+            # Prioritize overall benchmark accuracy while ensuring tail does not regress below baseline
+            is_better = (val_acc > best_val_acc and tail_acc >= baseline_tail_acc)
+            if not is_better and abs(val_acc - best_val_acc) < 1e-4 and tail_acc > best_tail_acc:
+                is_better = True
+                
             if is_better:
-                best_score = max(score, best_score)
-                best_val_acc = max(val_acc, best_val_acc)
+                best_val_acc = val_acc
                 best_tail_acc = tail_acc
                 best_epoch = epoch
                 best_state = {k: v.detach().cpu().clone()
@@ -1178,7 +1190,7 @@ class MemoryConditionedOrchestrator:
                 
                 checkpoint_path = os.path.join(
                     self.config['paths']['checkpoint_dir'],
-                    f"model_synthetic_round{len(self.metrics['generation_rounds'])}_tail{tail_acc:.2f}.pt"
+                    f"model_synthetic_round{len(self.metrics['generation_rounds'])}_acc{val_acc:.2f}_tail{tail_acc:.2f}.pt"
                 )
                 torch.save({
                     'model_state_dict': self.model.state_dict(),
@@ -1187,11 +1199,11 @@ class MemoryConditionedOrchestrator:
                     'accuracy': val_acc,
                     'tail_accuracy': tail_acc
                 }, checkpoint_path)
-                print(f"    ✓ Checkpoint saved: {checkpoint_path}")
+                print(f"    ✓ Checkpoint saved: {checkpoint_path} (Val: {val_acc:.2f}%, Tail: {tail_acc:.2f}%)")
             else:
                 epochs_without_gain += 1
                 if epochs_without_gain >= patience:
-                    print(f"    Tail accuracy has not improved for {patience} epochs, "
+                    print(f"    Overall accuracy has not improved for {patience} epochs, "
                           f"stopping the synthetic stage early")
                     break
         
@@ -1349,14 +1361,34 @@ class MemoryConditionedOrchestrator:
             
             self.metrics['generation_rounds'].append(round_idx)
             
+            # Select target classes for this round:
+            # Round 1: Target initial minority (tail) classes
+            # Round 2+: Adaptively target the currently lowest-performing classes across the dataset
+            # (lifting lagging medium classes and any stubborn tail classes)
+            if round_idx == 0:
+                target_classes = list(self.tail_classes)
+                print(f"Targeting initial {len(target_classes)} tail classes for Round 1.")
+            else:
+                target_classes = self._select_underperforming_classes(max_classes=len(self.tail_classes))
+                med_count = sum(1 for c in target_classes if c not in self.tail_classes and c not in self.head_classes)
+                tail_count = sum(1 for c in target_classes if c in self.tail_classes)
+                head_count = sum(1 for c in target_classes if c in self.head_classes)
+                print(f"\nAdaptive Targeting for Round {round_idx + 1}: selected {len(target_classes)} lowest-performing classes "
+                      f"({tail_count} tail, {med_count} medium, {head_count} head):")
+                for c in target_classes[:10]:
+                    grp = "TAIL" if c in self.tail_classes else "HEAD" if c in self.head_classes else "MED"
+                    print(f"  Class {c} ({self.class_names[c]} [{grp}])")
+                if len(target_classes) > 10:
+                    print(f"  ... and {len(target_classes) - 10} more classes")
+            
             # Step 3: Generate prompts
-            prompts = self.step3_generate_prompts()
+            prompts = self.step3_generate_prompts(target_classes=target_classes)
             
             # Step 4: Generate images
             images = self.step4_generate_images(prompts)
             
             # Step 5: Extract features (including DDPM)
-            features = self.step5_extract_features(images)
+            features = self.step5_extract_features(images, target_classes=target_classes)
             
             # Step 6: Train with synthetic data
             improvement = self.step6_train_with_synthetic(
@@ -1368,9 +1400,9 @@ class MemoryConditionedOrchestrator:
             self.metrics['round_summaries'].append(improvement)
             
             # Check improvement threshold
-            if improvement['tail'] < threshold:
-                print(f"\nTail improvement below threshold "
-                      f"({improvement['tail']:+.2f} pp < {threshold:.1f} pp)")
+            if improvement['overall'] < threshold and improvement['tail'] < threshold:
+                print(f"\nImprovement below threshold "
+                      f"(Overall: {improvement['overall']:+.2f} pp, Tail: {improvement['tail']:+.2f} pp < {threshold:.1f} pp)")
                 if early_stop:
                     print("Stopping iterative improvement.")
                     break
@@ -1378,6 +1410,41 @@ class MemoryConditionedOrchestrator:
         
         # Generate final report
         self._generate_final_report()
+    
+    def _select_underperforming_classes(self, max_classes=None):
+        """
+        Dynamically identify classes that need synthetic support the most.
+        Evaluates current validation accuracy and selects the lowest-performing classes
+        across the dataset (focusing on lagging medium and stubborn tail classes).
+        """
+        if max_classes is None:
+            max_classes = len(self.tail_classes)
+            
+        _, _, class_accuracies = self._evaluate()
+        num_classes = self.config['model']['num_classes']
+        
+        # Rank all classes by validation accuracy ascending
+        ranked = sorted(range(num_classes), key=lambda c: class_accuracies.get(c, 0.0))
+        
+        # Prefer classes that are tail or medium, or any severely struggling head class
+        # (accuracy < 60%) to avoid wasting generation budget on already well-learned head classes
+        selected = []
+        for c in ranked:
+            acc = class_accuracies.get(c, 0.0)
+            if c not in self.head_classes or acc < 60.0:
+                selected.append(c)
+            if len(selected) >= max_classes:
+                break
+                
+        # Fallback if fewer than max_classes matched
+        if len(selected) < max_classes:
+            for c in ranked:
+                if c not in selected:
+                    selected.append(c)
+                if len(selected) >= max_classes:
+                    break
+                    
+        return selected
     
     def _get_average_tail_accuracy(self):
         """Calculate average accuracy across tail classes."""
