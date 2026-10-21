@@ -81,8 +81,10 @@ def get_default_config():
         'training': {
             'loss_type': 'ldal',          # 'ldal' (paper1 SOTA) or 'csl' (legacy baseline)
             'ldal_tau': 5.0,              # LDAL dynamic importance cap tau (Eq. 4)
-            'ldal_alpha': 1.0,            # LDAL inter-epoch regularizer strength alpha (Eq. 5)
+            'ldal_alpha': 2.0,            # LDAL inter-epoch regularizer strength alpha (author default: 2.0)
             'ldal_epsilon': 1.0,          # LDAL denominator stability epsilon (Eq. 1)
+            'ldal_target_scope': 'all',   # 'all' (author setup: all classes) or 'tail' (tail classes only)
+            'grad_clip': 1.0,             # Gradient clipping max norm (author setup: 1.0)
             'initial_epochs': 200,
             'synthetic_epochs': 25,       # Enough to integrate synthetic features
             'lr': 0.1,

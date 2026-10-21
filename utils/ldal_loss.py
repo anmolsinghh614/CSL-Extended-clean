@@ -19,7 +19,7 @@ class LDALLossFunc(nn.Module):
         - r_i: Inter-epoch regularizer (+alpha if minority class predictions decreased, -alpha if increased).
         - denom_i: Mean squared deviation between batch logits and class one-hot encoding (with stop-gradient).
     """
-    def __init__(self, target_minority_classes, num_classes, tau=5.0, alpha=1.0, epsilon=1.0):
+    def __init__(self, target_minority_classes, num_classes, tau=5.0, alpha=2.0, epsilon=1.0):
         super(LDALLossFunc, self).__init__()
         self.num_classes = num_classes
         self.tau = float(tau)
@@ -120,11 +120,11 @@ class LDALLossFunc(nn.Module):
             H = self.ent_sum / torch.clamp(self.ent_count, min=1.0)  # [C]
             
             # Handle classes with no observed samples yet in this epoch
-            S = torch.where(self.norm_count > 0, S, torch.ones_like(S))
-            H = torch.where(self.ent_count > 0, H, torch.zeros_like(H))
+            S[self.norm_count == 0] = 0.0
+            H[self.ent_count == 0] = 0.0
             
             # 6. Dynamic Importance Weight: gamma_i = min( S_i / (1 + max_j(S_j) * H_i), tau )
-            S_max = torch.max(S)
+            S_max = S.max() + 1e-6
             gamma = S / (1.0 + S_max * H)
             gamma = torch.clamp(gamma, max=self.tau)  # [C]
             

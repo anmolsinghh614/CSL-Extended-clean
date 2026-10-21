@@ -253,11 +253,13 @@ class MemoryConditionedOrchestrator:
         tail_classes = getattr(self, 'tail_classes', [])
         if loss_type == 'ldal':
             tau = self.config['training'].get('ldal_tau', 5.0)
-            alpha = self.config['training'].get('ldal_alpha', 1.0)
+            alpha = self.config['training'].get('ldal_alpha', 2.0)
             epsilon = self.config['training'].get('ldal_epsilon', 1.0)
-            print(f"Using LDALLossFunc (tau={tau}, alpha={alpha}, epsilon={epsilon})")
+            target_scope = self.config['training'].get('ldal_target_scope', 'all')
+            target_classes = list(range(num_classes)) if target_scope == 'all' else tail_classes
+            print(f"Using LDALLossFunc (tau={tau}, alpha={alpha}, epsilon={epsilon}, target_scope={target_scope} [{len(target_classes)} classes])")
             return LDALLossFunc(
-                target_minority_classes=tail_classes,
+                target_minority_classes=target_classes,
                 num_classes=num_classes,
                 tau=tau,
                 alpha=alpha,
@@ -395,6 +397,9 @@ class MemoryConditionedOrchestrator:
             loss = self.criterion(labels, outputs, epoch)
             
             loss.backward()
+            grad_clip = self.config['training'].get('grad_clip', 1.0)
+            if grad_clip is not None and grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=grad_clip)
             self.optimizer.step()
             
             # Update memory bank from the features this pass already produced
@@ -1125,6 +1130,9 @@ class MemoryConditionedOrchestrator:
                 
                 loss = criterion(labels, outputs, epoch)
                 loss.backward()
+                grad_clip = training_config.get('grad_clip', 1.0)
+                if grad_clip is not None and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
                 optimizer.step()
                 
                 self.memory_manager.update_memory_from_features(labels, feature_data.detach())

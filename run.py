@@ -101,7 +101,7 @@ def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
                   f"--imbalance {imbalance} does not apply and is ignored.")
 
     backbone = arch or protocol['backbone']
-    feature_dim = 2048 if backbone in ('ResNet50', 'ResNet101') else 64
+    feature_dim = 2048 if backbone in ('ResNet50', 'ResNet101') else (512 if backbone in ('ResNet34',) else 64)
 
     config = merge_config({
         'dataset': dataset_section,
@@ -151,6 +151,8 @@ def run_full_training():
                        help='Imbalance ratio for the CIFAR benchmarks (default: 100)')
     parser.add_argument('--loss', choices=['ldal', 'csl'], default=None,
                        help="Loss function: 'ldal' (default) or 'csl'")
+    parser.add_argument('--image-size', type=int, default=None,
+                       help='Input image resolution (e.g. 224 for LDAL paper setup)')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID (default: 0)')
     args = parser.parse_args(sys.argv[2:])  # Skip 'run.py full'
     
@@ -160,6 +162,8 @@ def run_full_training():
     overrides = {}
     if args.loss:
         overrides['training'] = {'loss_type': args.loss}
+    if args.image_size:
+        overrides['dataset'] = {'image_size': args.image_size}
     config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides=overrides)
     print(f"  Dataset: {args.dataset} ({config['model']['num_classes']} classes)")
     print(f"  Backbone: {config['model']['architecture']}")
@@ -213,6 +217,10 @@ def run_custom():
                        help='Skip Stable Diffusion image synthesis (much faster)')
     parser.add_argument('--loss', choices=['ldal', 'csl'], default=None,
                        help="Loss function: 'ldal' (default) or 'csl'")
+    parser.add_argument('--image-size', type=int, default=None,
+                       help='Input image resolution (e.g. 224 for LDAL paper setup)')
+    parser.add_argument('--weight-decay', type=float, default=None,
+                       help='Weight decay (default: benchmark protocol)')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU device ID (default: 0)')
     
@@ -224,9 +232,11 @@ def run_custom():
     # Build a real config so custom runs get the same defaults as the full run, rather than
     # the orchestrator's bare-argument path.
     config = _dataset_config(args.dataset, args.arch, args.imbalance, overrides={
+        'dataset': section(image_size=args.image_size),
         'training': section(initial_epochs=args.epochs,
                             synthetic_epochs=args.synthetic_epochs,
-                            loss_type=args.loss),
+                            loss_type=args.loss,
+                            weight_decay=args.weight_decay),
         'generation': section(num_prompts_per_tail_class=args.prompts,
                               images_per_prompt=args.images,
                               generation_rounds=args.rounds,
