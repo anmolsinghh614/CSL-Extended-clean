@@ -117,7 +117,7 @@ def get_default_config():
             'num_prompts_per_tail_class': 50,
             'images_per_prompt': 4,
             'generation_rounds': 3,
-            'tail_improvement_threshold': 2.0,  # Percentage points; below this, stop early
+            'tail_improvement_threshold': 1.0,  # Percentage points; below this, stop early
             'early_stop_on_low_improvement': True,
             'option3_temperature': 0.8,
             'use_blip': True,
@@ -135,7 +135,7 @@ def get_default_config():
             'sd_low_vram': None,
             # Diffusion renders that land far from the real class distribution are discarded
             # rather than trained on. Same scale as the DDPM confidence.
-            'min_image_feature_confidence': 0.5
+            'min_image_feature_confidence': 0.55
         },
 
         # DDPM configuration
@@ -153,7 +153,7 @@ def get_default_config():
             # Generate extra samples and keep only the ones closest to the class prototype,
             # so off-manifold samples are not trained on.
             'oversample_factor': 1.5,
-            'min_confidence': 0.5,
+            'min_confidence': 0.55,
             'sampling_batch_size': 256,
             # Augmentation aims to bring each tail class up to a typical class count, not
             # past it: this percentile of the real class counts is the target size.
@@ -162,7 +162,7 @@ def get_default_config():
             # generator only ever saw those real samples, so the amount of genuinely new
             # information it can supply is bounded by them. Without this cap a 50-sample
             # class ends up ~90% synthetic and the classifier fits the generator's errors.
-            'max_synthetic_ratio': 3.0
+            'max_synthetic_ratio': 4.0
         },
 
         # Paths

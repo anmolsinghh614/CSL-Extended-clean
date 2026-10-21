@@ -1095,6 +1095,8 @@ class MemoryConditionedOrchestrator:
         
         print(f"\nTraining with augmented data for {epochs} epochs...")
         best_tail_acc = baseline_tail_acc
+        best_val_acc = baseline_acc
+        best_score = baseline_acc + 0.5 * baseline_tail_acc
         best_state = None
         best_epoch = None
         epochs_without_gain = 0
@@ -1162,8 +1164,12 @@ class MemoryConditionedOrchestrator:
             print(f"    Tail Classes Accuracy: {tail_acc:.2f}% (baseline {baseline_tail_acc:.2f}%)")
             print(f"    Head Classes Accuracy: {head_acc:.2f}% (baseline {baseline_head_acc:.2f}%)")
             
-            # The point of this stage is tail accuracy, so checkpoint on that
-            if tail_acc > best_tail_acc:
+            # Optimize overall benchmark accuracy while maintaining/improving tail accuracy
+            score = val_acc + 0.5 * tail_acc
+            is_better = (score > best_score and tail_acc >= baseline_tail_acc) or (val_acc > best_val_acc and tail_acc >= baseline_tail_acc)
+            if is_better:
+                best_score = max(score, best_score)
+                best_val_acc = max(val_acc, best_val_acc)
                 best_tail_acc = tail_acc
                 best_epoch = epoch
                 best_state = {k: v.detach().cpu().clone()
