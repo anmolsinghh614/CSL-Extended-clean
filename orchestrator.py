@@ -863,9 +863,8 @@ class MemoryConditionedOrchestrator:
         
         target = int(np.percentile(self.samples_per_class,
                                    ddpm_config['balance_target_percentile']))
-        # Ensure a floor of 25 features for any targeted class to deliver a meaningful boost
-        budget = max(25, target - real_count)
-        budget = min(budget, max(30, int(ddpm_config['max_synthetic_ratio'] * real_count)))
+        budget = max(0, target - real_count)
+        budget = min(budget, int(ddpm_config['max_synthetic_ratio'] * real_count))
         
         return min(budget, int(ddpm_config['features_per_class']))
     
@@ -1108,8 +1107,9 @@ class MemoryConditionedOrchestrator:
         print(f"\nTraining with augmented data for {epochs} epochs...")
         best_tail_acc = baseline_tail_acc
         best_val_acc = baseline_acc
-        best_state = None
-        best_epoch = None
+        # Guarantee safety: initialize best_state with baseline so the pipeline never regresses
+        best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        best_epoch = -1
         epochs_without_gain = 0
         patience = training_config['synthetic_patience']
         
@@ -1361,25 +1361,21 @@ class MemoryConditionedOrchestrator:
             
             self.metrics['generation_rounds'].append(round_idx)
             
-            # Select target classes for this round:
-            # Round 1: Target initial minority (tail) classes
-            # Round 2+: Adaptively target the currently lowest-performing classes across the dataset
-            # (lifting lagging medium classes and any stubborn tail classes)
+            # Focus generative models strictly on minority (tail) classes
+            # Round 1: Target all minority tail classes
+            # Round 2+: Adaptively focus on the weakest tail classes that still need improvement
             if round_idx == 0:
                 target_classes = list(self.tail_classes)
-                print(f"Targeting initial {len(target_classes)} tail classes for Round 1.")
+                print(f"Targeting {len(target_classes)} minority tail classes for Round 1.")
             else:
-                target_classes = self._select_underperforming_classes(max_classes=len(self.tail_classes))
-                med_count = sum(1 for c in target_classes if c not in self.tail_classes and c not in self.head_classes)
-                tail_count = sum(1 for c in target_classes if c in self.tail_classes)
-                head_count = sum(1 for c in target_classes if c in self.head_classes)
-                print(f"\nAdaptive Targeting for Round {round_idx + 1}: selected {len(target_classes)} lowest-performing classes "
-                      f"({tail_count} tail, {med_count} medium, {head_count} head):")
-                for c in target_classes[:10]:
-                    grp = "TAIL" if c in self.tail_classes else "HEAD" if c in self.head_classes else "MED"
-                    print(f"  Class {c} ({self.class_names[c]} [{grp}])")
-                if len(target_classes) > 10:
-                    print(f"  ... and {len(target_classes) - 10} more classes")
+                # Rank tail classes by their current validation accuracy ascending
+                _, _, class_accuracies = self._evaluate()
+                sorted_tail = sorted(self.tail_classes, key=lambda c: class_accuracies.get(c, 0.0))
+                # Target the lower half of tail classes that still need the most improvement
+                target_classes = sorted_tail[:max(5, len(self.tail_classes) // 2)]
+                print(f"\nAdaptive Focus for Round {round_idx + 1}: targeting {len(target_classes)} weakest tail classes:")
+                for c in target_classes:
+                    print(f"  Class {c} ({self.class_names[c]} [TAIL]): {class_accuracies.get(c, 0.0):.2f}%")
             
             # Step 3: Generate prompts
             prompts = self.step3_generate_prompts(target_classes=target_classes)
