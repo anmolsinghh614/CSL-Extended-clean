@@ -92,7 +92,7 @@ def get_default_config():
             'weight_decay': 2e-4,
             'scheduler_milestones': [160, 180],
             'scheduler_gamma': 0.01,
-            'synthetic_lr_scale': 0.1,    # Fine-tuning LR relative to the base LR
+            'synthetic_lr_scale': 0.05,   # Gentle fine-tuning LR to preserve learned head class weights
             # Synthetic features are vectors in the feature space of the frozen backbone.
             # If the backbone keeps training they stop describing anything the classifier
             # sees, so the synthetic stage retrains the classifier only.
@@ -109,7 +109,7 @@ def get_default_config():
             # tail. Keep the best-tail epoch and stop once it stops improving, so the stage
             # returns the model it found rather than the last one it happened to produce.
             'restore_best_synthetic': True,
-            'synthetic_patience': 5
+            'synthetic_patience': 8
         },
 
         # Synthetic generation configuration

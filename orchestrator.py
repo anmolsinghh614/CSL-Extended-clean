@@ -1093,16 +1093,13 @@ class MemoryConditionedOrchestrator:
             weight_decay=training_config['weight_decay']
         )
         
-        # Reweight CSL using the augmented distribution so tail classes are not corrected
-        # twice over (extra samples plus an inverse-frequency loss weight).
-        if training_config['reweight_csl_for_synthetic']:
-            effective_counts = [
-                self.samples_per_class[c] + synthetic_counts.get(c, 0) for c in range(num_classes)
-            ]
-        else:
-            effective_counts = self.samples_per_class
+        # In synthetic retraining, data is already physically balanced with synthetic features.
+        # Use clean Cross-Entropy to prevent double-correction and preserve learned head-class boundaries.
+        class CEOnlyCriterion(torch.nn.Module):
+            def forward(self, labels, outputs, epoch=None):
+                return F.cross_entropy(outputs, labels.squeeze().long())
         
-        criterion = self._build_criterion(effective_counts)
+        criterion = CEOnlyCriterion()
         
         print(f"\nTraining with augmented data for {epochs} epochs...")
         best_tail_acc = baseline_tail_acc
@@ -1138,7 +1135,10 @@ class MemoryConditionedOrchestrator:
                 else:  # Features (B, D) bypass the backbone and go straight to the classifier
                     if data.dim() > 2:
                         data = data.view(data.size(0), -1)
-                    outputs = classifier(data)
+                    # Feature-space jitter for data augmentation on precomputed features:
+                    # Gives real head features smooth margins, preventing decision boundary collapse
+                    jitter = torch.randn_like(data) * 0.02
+                    outputs = classifier(data + jitter)
                     feature_data = data
                 
                 loss = criterion(labels, outputs, epoch)
