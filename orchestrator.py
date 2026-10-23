@@ -328,7 +328,14 @@ class MemoryConditionedOrchestrator:
         
         # Learning rate scheduler
         sched_type = self.config['training'].get('scheduler_type', 'multistep')
-        if sched_type == 'lambda_exp':
+        if sched_type == 'cosine':
+            t_max = int(self.config['training'].get('scheduler_t_max', self.config['training']['initial_epochs']))
+            eta_min = float(self.config['training'].get('scheduler_eta_min', 0.0))
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=t_max, eta_min=eta_min
+            )
+            print(f"  Scheduler: CosineAnnealingLR (T_max={t_max}, eta_min={eta_min})")
+        elif sched_type == 'lambda_exp':
             gamma = float(self.config['training'].get('scheduler_gamma', 0.99))
             self.scheduler = optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=lambda ep: gamma ** ep

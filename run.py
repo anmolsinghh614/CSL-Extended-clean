@@ -119,7 +119,8 @@ def _dataset_config(dataset, arch=None, imbalance=None, overrides=None):
             'lr': protocol['lr'],
             'momentum': protocol['momentum'],
             'weight_decay': protocol['weight_decay'],
-            'scheduler_milestones': protocol['lr_decay_epochs'],
+            'scheduler_type': protocol.get('scheduler_type', 'multistep'),
+            'scheduler_milestones': protocol.get('lr_decay_epochs', [160, 180]),
             'scheduler_gamma': protocol['lr_decay_factor'],
         },
     })
@@ -227,7 +228,7 @@ def run_custom():
                        help='Batch size (e.g. 256 for LDAL paper setup)')
     parser.add_argument('--lr', type=float, default=None,
                        help='Initial learning rate (e.g. 0.001 for author notebook setup)')
-    parser.add_argument('--scheduler', choices=['multistep', 'lambda_exp'], default=None,
+    parser.add_argument('--scheduler', choices=['multistep', 'lambda_exp', 'cosine'], default=None,
                        help="Scheduler type: 'multistep' (step decay) or 'lambda_exp' (author notebook: 0.99**epoch)")
     parser.add_argument('--gamma', type=float, default=None,
                        help='Scheduler gamma factor (e.g. 0.99 for lambda_exp)')

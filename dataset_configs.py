@@ -83,7 +83,8 @@ DATASET_CONFIGS = {
         'lr': 0.1,
         'lr_decay_epochs': [60, 80],
         'lr_decay_factor': 0.1,
-        'weight_decay': 2e-4,
+        'scheduler_type': 'cosine',   # Author main.py uses CosineAnnealingLR(T_max=120)
+        'weight_decay': 5e-4,         # Author main.py uses 5e-4 for ImageNet
         'momentum': 0.9,
         'batch_size': 256,
         'imbalance_ratios': [None],   # Natural long-tail (Pareto)
@@ -102,10 +103,11 @@ DATASET_CONFIGS = {
         'norm_std': [0.195, 0.194, 0.192],
         'backbone': 'ResNet50',
         'epochs': 160,                # LDAL reports 160 epochs on iNaturalist-2018
-        'lr': 0.05,
+        'lr': 0.1,                    # Author main.py default lr is 0.1
+        'scheduler_type': 'cosine',   # Author main.py uses CosineAnnealingLR(T_max=160)
         'lr_decay_epochs': [120, 145],
         'lr_decay_factor': 0.1,
-        'weight_decay': 1e-4,
+        'weight_decay': 2e-4,         # Author main.py uses 2e-4 for iNat
         'momentum': 0.9,
         'batch_size': 256,
         'imbalance_ratios': [None],   # Natural long-tail
