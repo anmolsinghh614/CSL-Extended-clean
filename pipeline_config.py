@@ -90,6 +90,7 @@ def get_default_config():
             'lr': 0.1,
             'momentum': 0.9,
             'weight_decay': 2e-4,
+            'scheduler_type': 'multistep',
             'scheduler_milestones': [160, 180],
             'scheduler_gamma': 0.01,
             'synthetic_lr_scale': 0.05,   # Gentle fine-tuning LR to preserve learned head class weights

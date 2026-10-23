@@ -80,8 +80,6 @@ def build_transforms(dataset, image_size=None):
     name = _normalize_name(dataset)
     if image_size is None:
         image_size = DATASET_SPECS[name]['image_size']
-    mean, std = DATASET_SPECS[name]['stats']
-    normalize = transforms.Normalize(mean, std)
 
     if image_size == 32:
         train_ops = [
@@ -89,6 +87,8 @@ def build_transforms(dataset, image_size=None):
             transforms.RandomHorizontalFlip(),
         ]
         eval_ops = []
+        mean, std = DATASET_SPECS[name]['stats']
+        normalize = transforms.Normalize(mean, std)
     else:
         train_ops = [
             transforms.RandomResizedCrop(image_size),
@@ -96,6 +96,8 @@ def build_transforms(dataset, image_size=None):
             transforms.ColorJitter(brightness=0.1),
         ]
         eval_ops = [transforms.Resize((image_size, image_size))]
+        # Exact author notebook setup for 224x224 upscaled CIFAR: (0.5, 0.5, 0.5)
+        normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 
     transform_train = transforms.Compose(train_ops + [transforms.ToTensor(), normalize])
     transform_eval = transforms.Compose(eval_ops + [transforms.ToTensor(), normalize])

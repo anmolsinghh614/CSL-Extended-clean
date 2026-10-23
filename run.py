@@ -225,6 +225,12 @@ def run_custom():
                        help='Input image resolution (e.g. 224 for LDAL paper setup)')
     parser.add_argument('--batch-size', type=int, default=None,
                        help='Batch size (e.g. 256 for LDAL paper setup)')
+    parser.add_argument('--lr', type=float, default=None,
+                       help='Initial learning rate (e.g. 0.001 for author notebook setup)')
+    parser.add_argument('--scheduler', choices=['multistep', 'lambda_exp'], default=None,
+                       help="Scheduler type: 'multistep' (step decay) or 'lambda_exp' (author notebook: 0.99**epoch)")
+    parser.add_argument('--gamma', type=float, default=None,
+                       help='Scheduler gamma factor (e.g. 0.99 for lambda_exp)')
     parser.add_argument('--weight-decay', type=float, default=None,
                        help='Weight decay (default: benchmark protocol)')
     parser.add_argument('--gpu', type=int, default=0,
@@ -242,6 +248,9 @@ def run_custom():
         'training': section(initial_epochs=args.epochs,
                             synthetic_epochs=args.synthetic_epochs,
                             loss_type=args.loss,
+                            lr=args.lr,
+                            scheduler_type=args.scheduler,
+                            scheduler_gamma=args.gamma,
                             weight_decay=args.weight_decay),
         'generation': section(num_prompts_per_tail_class=args.prompts,
                               images_per_prompt=args.images,

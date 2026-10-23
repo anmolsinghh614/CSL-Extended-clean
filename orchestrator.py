@@ -327,11 +327,20 @@ class MemoryConditionedOrchestrator:
         )
         
         # Learning rate scheduler
-        self.scheduler = optim.lr_scheduler.MultiStepLR(
-            self.optimizer,
-            milestones=self.config['training']['scheduler_milestones'],
-            gamma=self.config['training']['scheduler_gamma']
-        )
+        sched_type = self.config['training'].get('scheduler_type', 'multistep')
+        if sched_type == 'lambda_exp':
+            gamma = float(self.config['training'].get('scheduler_gamma', 0.99))
+            self.scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda ep: gamma ** ep
+            )
+            print(f"  Scheduler: LambdaLR exponential decay ({gamma} ** epoch)")
+        else:
+            self.scheduler = optim.lr_scheduler.MultiStepLR(
+                self.optimizer,
+                milestones=self.config['training']['scheduler_milestones'],
+                gamma=self.config['training']['scheduler_gamma']
+            )
+            print(f"  Scheduler: MultiStepLR (milestones={self.config['training']['scheduler_milestones']}, gamma={self.config['training']['scheduler_gamma']})")
         
         # Training loop
         best_acc = 0.0
