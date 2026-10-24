@@ -93,7 +93,8 @@ def get_default_config():
             'scheduler_type': 'multistep',
             'scheduler_milestones': [160, 180],
             'scheduler_gamma': 0.01,
-            'synthetic_lr_scale': 0.05,   # Gentle fine-tuning LR to preserve learned head class weights
+            'synthetic_lr_scale': 0.02,   # Locked fine-tuning LR (0.02) to strictly protect head class margins
+            'logit_adjustment_tau': 0.0,  # Logit adjustment tau at test time (e.g. 0.5-1.0 to level prior; 0.0 to disable)
             # Synthetic features are vectors in the feature space of the frozen backbone.
             # If the backbone keeps training they stop describing anything the classifier
             # sees, so the synthetic stage retrains the classifier only.
@@ -124,6 +125,9 @@ def get_default_config():
             'use_blip': True,
             'use_clip': True,
             'num_exemplars_per_tail_class': 5,
+            'generate_medium_classes': True,      # Also synthesize for medium classes
+            'num_prompts_per_medium_class': 8,    # Focused prompt count for medium classes
+            'images_per_medium_prompt': 2,        # Images per prompt for medium classes
             # Stable Diffusion is the expensive half of the synthesis. Disabling it leaves
             # the feature-space DDPM path, which is fast enough to iterate on.
             'use_stable_diffusion': True,
@@ -158,12 +162,13 @@ def get_default_config():
             'sampling_batch_size': 256,
             # Augmentation aims to bring each tail class up to a typical class count, not
             # past it: this percentile of the real class counts is the target size.
-            'balance_target_percentile': 50.0,
+            'balance_target_percentile': 65.0,  # Lift classes towards 65th percentile (~120 samples)
             # ...but never add more than this multiple of a class's real samples. The
             # generator only ever saw those real samples, so the amount of genuinely new
             # information it can supply is bounded by them. Without this cap a 50-sample
             # class ends up ~90% synthetic and the classifier fits the generator's errors.
-            'max_synthetic_ratio': 4.0
+            'max_synthetic_ratio': 8.0,         # Lifted from 4x to 8x for true minority tail
+            'min_synthetic_floor': 60            # Minimum feature floor so 5-sample classes get at least 60 features
         },
 
         # Paths

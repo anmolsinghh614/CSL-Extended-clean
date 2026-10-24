@@ -234,6 +234,22 @@ def run_custom():
                        help='Scheduler gamma factor (e.g. 0.99 for lambda_exp)')
     parser.add_argument('--weight-decay', type=float, default=None,
                        help='Weight decay (default: benchmark protocol)')
+    parser.add_argument('--synthetic-lr-scale', type=float, default=None,
+                       help='LR scale for synthetic fine-tuning (default: 0.02)')
+    parser.add_argument('--logit-adj', type=float, default=None,
+                       help='Logit adjustment tau at test time (e.g. 0.5 or 1.0; default 0.0)')
+    parser.add_argument('--generate-medium', action='store_true', default=None,
+                       help='Also synthesize prompts, images, and features for medium classes')
+    parser.add_argument('--no-generate-medium', action='store_false', dest='generate_medium',
+                       help='Disable synthetic generation for medium classes')
+    parser.add_argument('--prompts-medium', type=int, default=None,
+                       help='Prompts per medium class (default: 8)')
+    parser.add_argument('--images-medium', type=int, default=None,
+                       help='Images per medium prompt (default: 2)')
+    parser.add_argument('--max-synthetic-ratio', type=float, default=None,
+                       help='Max synthetic-to-real ratio in DDPM (default: 8.0)')
+    parser.add_argument('--min-synthetic-floor', type=int, default=None,
+                       help='Min synthetic features floor for tail classes (default: 60)')
     parser.add_argument('--gpu', type=int, default=0,
                        help='GPU device ID (default: 0)')
     
@@ -252,12 +268,19 @@ def run_custom():
                             lr=args.lr,
                             scheduler_type=args.scheduler,
                             scheduler_gamma=args.gamma,
-                            weight_decay=args.weight_decay),
+                            weight_decay=args.weight_decay,
+                            synthetic_lr_scale=args.synthetic_lr_scale,
+                            logit_adjustment_tau=args.logit_adj),
         'generation': section(num_prompts_per_tail_class=args.prompts,
                               images_per_prompt=args.images,
                               generation_rounds=args.rounds,
-                              use_stable_diffusion=args.stable_diffusion),
-        'ddpm': section(enabled=args.ddpm),
+                              use_stable_diffusion=args.stable_diffusion,
+                              generate_medium_classes=args.generate_medium,
+                              num_prompts_per_medium_class=args.prompts_medium,
+                              images_per_medium_prompt=args.images_medium),
+        'ddpm': section(enabled=args.ddpm,
+                        max_synthetic_ratio=args.max_synthetic_ratio,
+                        min_synthetic_floor=args.min_synthetic_floor),
     })
     
     training = config['training']

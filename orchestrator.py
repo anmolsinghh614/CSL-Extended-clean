@@ -92,6 +92,7 @@ class MemoryConditionedOrchestrator:
             'tail_class_accuracies': defaultdict(list),
             'head_class_accuracies': defaultdict(list),
             'tail_group_accuracies': [],
+            'medium_group_accuracies': [],
             'head_group_accuracies': [],
             'stage_boundaries': [],
             'generation_rounds': [],
@@ -111,6 +112,7 @@ class MemoryConditionedOrchestrator:
         # that anything logging a class can do so before the data is loaded.
         self.class_names = [f"class_{i}" for i in range(self.config['model']['num_classes'])]
         self.tail_classes = []
+        self.medium_classes = []
         self.head_classes = []
         self.samples_per_class = []
         
@@ -219,6 +221,8 @@ class MemoryConditionedOrchestrator:
                              if count <= tail_threshold]
         self.head_classes = [i for i, count in enumerate(samples_per_class)
                              if count >= head_threshold]
+        self.medium_classes = [i for i, count in enumerate(samples_per_class)
+                               if tail_threshold < count < head_threshold]
         
         print(f"\n✓ Dataset created successfully")
         print(f"  Total samples: {sum(samples_per_class)}")
@@ -386,6 +390,7 @@ class MemoryConditionedOrchestrator:
         self.baseline_snapshot = {
             'overall': self.metrics['epoch_accuracies'][-1] if self.metrics['epoch_accuracies'] else 0.0,
             'tail': self.metrics['tail_group_accuracies'][-1] if self.metrics['tail_group_accuracies'] else 0.0,
+            'medium': self.metrics['medium_group_accuracies'][-1] if self.metrics.get('medium_group_accuracies') else 0.0,
             'head': self.metrics['head_group_accuracies'][-1] if self.metrics['head_group_accuracies'] else 0.0,
             'per_class': {cls: accs[-1] for cls, accs in self.metrics['class_accuracies'].items() if accs}
         }
@@ -455,6 +460,15 @@ class MemoryConditionedOrchestrator:
                 # Plain cross-entropy: the CSL criterion carries per-epoch prediction
                 # counters used to steer tail weighting, and feeding test predictions into
                 # them would corrupt a training signal with validation data.
+                # Optional Logit Adjustment: post-hoc prior compensation
+                tau = float(self.config['training'].get('logit_adjustment_tau', 0.0))
+                if tau > 0:
+                    if not hasattr(self, '_log_prior') or self._log_prior is None or self._log_prior.device != self.device:
+                        counts = torch.tensor(self.samples_per_class, dtype=torch.float32, device=self.device)
+                        prior = counts / counts.sum()
+                        self._log_prior = torch.log(prior + 1e-12)
+                    outputs = outputs - tau * self._log_prior
+
                 loss = F.cross_entropy(outputs, labels)
                 
                 val_loss += loss.item() * inputs.size(0)
@@ -543,7 +557,9 @@ class MemoryConditionedOrchestrator:
         print("="*80)
         
         if target_classes is None:
-            target_classes = self.tail_classes
+            target_classes = list(self.tail_classes)
+            if self.config['generation'].get('generate_medium_classes', False):
+                target_classes = sorted(list(set(self.tail_classes + getattr(self, 'medium_classes', []))))
             
         # Initialize Option 3 generator once and reuse it across rounds; CLIP and BLIP are
         # several hundred megabytes each and reloading them per round is pure overhead.
@@ -568,14 +584,21 @@ class MemoryConditionedOrchestrator:
         all_captions = {}
         
         for cls_idx in target_classes:
-            print(f"\nGenerating prompts for class {cls_idx} ({self.class_names[cls_idx]})...")
+            is_medium = hasattr(self, 'medium_classes') and cls_idx in self.medium_classes
+            group_tag = "MEDIUM" if is_medium else "TAIL"
+            print(f"\nGenerating prompts for class {cls_idx} ({self.class_names[cls_idx]} [{group_tag}])...")
             
+            num_prompts = (
+                self.config['generation'].get('num_prompts_per_medium_class', 8)
+                if is_medium else
+                self.config['generation']['num_prompts_per_tail_class']
+            )
             class_exemplars = exemplars.get(cls_idx, [])
             prompts, captions = self.prompt_generator.generate_prompts_from_exemplars(
                 class_idx=cls_idx,
                 class_name=self.class_names[cls_idx],
                 exemplar_images=class_exemplars,
-                num_prompts=self.config['generation']['num_prompts_per_tail_class'],
+                num_prompts=num_prompts,
                 temperature=self.config['generation']['option3_temperature']
             )
             
@@ -625,7 +648,9 @@ class MemoryConditionedOrchestrator:
             Dict[class_id -> list of normalized image tensors]
         """
         if target_classes is None:
-            target_classes = self.tail_classes
+            target_classes = list(self.tail_classes)
+            if self.config['generation'].get('generate_medium_classes', False):
+                target_classes = sorted(list(set(self.tail_classes + getattr(self, 'medium_classes', []))))
             
         print(f"\nSelecting {num_exemplars} visual exemplars per target class from memory prototypes...")
         
@@ -687,14 +712,19 @@ class MemoryConditionedOrchestrator:
         
         for cls_idx, class_prompts in prompts.items():
             cls_idx = int(cls_idx) if isinstance(cls_idx, str) else cls_idx
-            print(f"\nGenerating images for class {cls_idx} ({self.class_names[cls_idx]})...")
+            is_medium = hasattr(self, 'medium_classes') and cls_idx in self.medium_classes
+            images_for_class = (
+                self.config['generation'].get('images_per_medium_prompt', 2)
+                if is_medium else images_per_prompt
+            )
+            print(f"\nGenerating images for class {cls_idx} ({self.class_names[cls_idx]} [{'MEDIUM' if is_medium else 'TAIL'}])...")
             
             class_images = []
             for prompt in tqdm(class_prompts, desc="Generating"):
                 images = self.image_generator.generate_batch(
                     prompts=[prompt],
                     class_idx=cls_idx,
-                    num_images_per_prompt=images_per_prompt,
+                    num_images_per_prompt=images_for_class,
                     num_inference_steps=self.config['generation']['sd_inference_steps'],
                     image_size=self.config['generation']['sd_image_size'],
                     guidance_scale=self.config['generation']['sd_guidance_scale'],
@@ -720,7 +750,9 @@ class MemoryConditionedOrchestrator:
         print("="*80)
         
         if target_classes is None:
-            target_classes = self.tail_classes
+            target_classes = list(self.tail_classes)
+            if self.config['generation'].get('generate_medium_classes', False):
+                target_classes = sorted(list(set(self.tail_classes + getattr(self, 'medium_classes', []))))
             
         synthetic_features = {}
         
@@ -880,7 +912,11 @@ class MemoryConditionedOrchestrator:
         target = int(np.percentile(self.samples_per_class,
                                    ddpm_config['balance_target_percentile']))
         budget = max(0, target - real_count)
-        budget = min(budget, int(ddpm_config['max_synthetic_ratio'] * real_count))
+        
+        min_floor = int(ddpm_config.get('min_synthetic_floor', 60))
+        max_ratio = float(ddpm_config.get('max_synthetic_ratio', 8.0))
+        max_cap = max(min_floor, int(max_ratio * real_count))
+        budget = min(budget, max_cap)
         
         return min(budget, int(ddpm_config['features_per_class']))
     
@@ -901,7 +937,9 @@ class MemoryConditionedOrchestrator:
     def _train_and_generate_ddpm_features(self, real_features, target_classes=None):
         """Train DDPM model and generate additional features."""
         if target_classes is None:
-            target_classes = self.tail_classes
+            target_classes = list(self.tail_classes)
+            if self.config['generation'].get('generate_medium_classes', False):
+                target_classes = sorted(list(set(self.tail_classes + getattr(self, 'medium_classes', []))))
         ddpm_config = self.config['ddpm']
         
         # Create training dataset for DDPM from the target classes
@@ -1382,16 +1420,22 @@ class MemoryConditionedOrchestrator:
             # Round 2+: Adaptively focus on the weakest tail classes that still need improvement
             if round_idx == 0:
                 target_classes = list(self.tail_classes)
-                print(f"Targeting {len(target_classes)} minority tail classes for Round 1.")
+                if self.config['generation'].get('generate_medium_classes', False):
+                    target_classes = sorted(list(set(self.tail_classes + getattr(self, 'medium_classes', []))))
+                print(f"Targeting {len(target_classes)} minority & medium classes for Round 1.")
             else:
                 # Rank tail classes by their current validation accuracy ascending
                 _, _, class_accuracies = self._evaluate()
                 sorted_tail = sorted(self.tail_classes, key=lambda c: class_accuracies.get(c, 0.0))
                 # Target the lower half of tail classes that still need the most improvement
                 target_classes = sorted_tail[:max(5, len(self.tail_classes) // 2)]
-                print(f"\nAdaptive Focus for Round {round_idx + 1}: targeting {len(target_classes)} weakest tail classes:")
+                if self.config['generation'].get('generate_medium_classes', False):
+                    sorted_med = sorted(getattr(self, 'medium_classes', []), key=lambda c: class_accuracies.get(c, 0.0))
+                    target_classes = sorted(list(set(target_classes + sorted_med[:max(5, len(self.medium_classes) // 3)])))
+                print(f"\nAdaptive Focus for Round {round_idx + 1}: targeting {len(target_classes)} weakest tail & medium classes:")
                 for c in target_classes:
-                    print(f"  Class {c} ({self.class_names[c]} [TAIL]): {class_accuracies.get(c, 0.0):.2f}%")
+                    tag = 'MEDIUM' if hasattr(self, 'medium_classes') and c in self.medium_classes else 'TAIL'
+                    print(f"  Class {c} ({self.class_names[c]} [{tag}]): {class_accuracies.get(c, 0.0):.2f}%")
             
             # Step 3: Generate prompts
             prompts = self.step3_generate_prompts(target_classes=target_classes)
@@ -1602,6 +1646,7 @@ class MemoryConditionedOrchestrator:
         final_overall = self.metrics['epoch_accuracies'][-1] if self.metrics['epoch_accuracies'] else 0.0
         final_tail = self.metrics['tail_group_accuracies'][-1] if self.metrics['tail_group_accuracies'] else 0.0
         final_head = self.metrics['head_group_accuracies'][-1] if self.metrics['head_group_accuracies'] else 0.0
+        final_medium = self.metrics['medium_group_accuracies'][-1] if self.metrics.get('medium_group_accuracies') else 0.0
         
         report = {
             'configuration': self.config,
@@ -1620,18 +1665,21 @@ class MemoryConditionedOrchestrator:
             'summary': {
                 'before_synthetic': {
                     'overall': baseline.get('overall', 0.0),
-                    'tail_group': baseline.get('tail', 0.0),
-                    'head_group': baseline.get('head', 0.0)
+                    'head_group': baseline.get('head', 0.0),
+                    'medium_group': baseline.get('medium', 0.0),
+                    'tail_group': baseline.get('tail', 0.0)
                 },
                 'after_synthetic': {
                     'overall': final_overall,
-                    'tail_group': final_tail,
-                    'head_group': final_head
+                    'head_group': final_head,
+                    'medium_group': final_medium,
+                    'tail_group': final_tail
                 },
                 'delta': {
                     'overall': final_overall - baseline.get('overall', 0.0),
-                    'tail_group': final_tail - baseline.get('tail', 0.0),
-                    'head_group': final_head - baseline.get('head', 0.0)
+                    'head_group': final_head - baseline.get('head', 0.0),
+                    'medium_group': final_medium - baseline.get('medium', 0.0),
+                    'tail_group': final_tail - baseline.get('tail', 0.0)
                 }
             },
             'round_summaries': self.metrics['round_summaries'],
@@ -1676,7 +1724,7 @@ class MemoryConditionedOrchestrator:
         
         summary = report['summary']
         print(f"\n{'Group':<12}{'Before':>12}{'After':>12}{'Change':>12}")
-        for label, key in [('Overall', 'overall'), ('Tail', 'tail_group'), ('Head', 'head_group')]:
+        for label, key in [('Overall', 'overall'), ('Head', 'head_group'), ('Medium', 'medium_group'), ('Tail', 'tail_group')]:
             print(f"{label:<12}{summary['before_synthetic'][key]:>11.2f}%"
                   f"{summary['after_synthetic'][key]:>11.2f}%"
                   f"{summary['delta'][key]:>+11.2f}")
